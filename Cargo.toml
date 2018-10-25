@@ -1,0 +1,40 @@
+[package]
+name = "rngine"
+version = "0.1.0"
+authors = ["Neil Shen <overvenus@gmail.com>"]
+edition = "2018"
+
+[lib]
+name = "rngine"
+
+[profile.dev]
+opt-level = 0  # Controls the --opt-level the compiler builds with
+debug = true   # Controls whether the compiler passes `-g`
+codegen-units = 4
+
+# The release profile, used for `cargo build --release`
+[profile.release]
+lto = true
+opt-level = 3
+debug = true
+
+[dependencies]
+futures = "0.1"
+grpcio = "0.4"
+fs2 = "0.4"
+serde = "1.0"
+serde_derive = "1.0"
+rustc-serialize = "0.3"
+toml = "0.4"
+clap = "2.32"
+log = { version = "0.3", features = ["release_max_level_debug"] }
+signal = "0.6"
+nix = "0.11"
+byteorder = "1.2"
+
+[dependencies.kvproto]
+git = "https://github.com/pingcap/kvproto.git"
+branch = "ov/engine"
+
+[dependencies.rocksdb]
+git = "https://github.com/pingcap/rust-rocksdb.git"
