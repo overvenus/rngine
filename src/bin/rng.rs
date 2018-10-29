@@ -22,7 +22,7 @@ use rngine::server::{Server, Service};
 fn main() {
     let matches = App::new("Rngine")
         .author("TiKV Org.")
-        .about("A Distributed transactional key-value database powered by Rust and Raft")
+        .about("A remote storage engine for TiKV")
         .arg(
             Arg::with_name("config")
                 .short("C")
@@ -53,7 +53,8 @@ fn main() {
         .map_or_else(RgConfig::default, |path| RgConfig::from_file(&path));
 
     // Install logger.
-    env_logger::init();
+    let env = env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info");
+    env_logger::Builder::from_env(env).init();
 
     let root_path = Path::new(&config.path);
     // Create root directory if missing.
