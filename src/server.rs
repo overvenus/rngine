@@ -12,12 +12,12 @@ use grpcio::{
 use kvproto::enginepb::{CommandRequestBatch, CommandResponseBatch, SnapshotDone, SnapshotRequest};
 use kvproto::enginepb_grpc::*;
 
-use super::engine::{Engine as Rngine, Task};
+use super::engine::{ApplyTask, Engine as Rngine};
 use super::worker::Scheduler;
 
 #[derive(Clone)]
 pub struct Service {
-    apply: Scheduler<Task>,
+    apply: Scheduler<ApplyTask>,
     applied_receiver: Arc<Mutex<Option<UnboundedReceiver<CommandResponseBatch>>>>,
 }
 
@@ -40,7 +40,7 @@ impl Engine for Service {
         let apply = self.apply.clone();
         let reqs = stream
             .for_each(move |cmds| {
-                apply.schedule(Task::new(cmds)).unwrap();
+                apply.schedule(ApplyTask::new(cmds)).unwrap();
                 Ok(())
             }).map_err(|e| {
                 error!("{:?}", e);

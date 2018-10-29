@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use futures::sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use futures::sync::mpsc::UnboundedSender;
 use kvproto::enginepb::{
     CommandRequestBatch, CommandResponse, CommandResponseBatch, CommandResponseHeader,
 };
@@ -11,46 +11,9 @@ use kvproto::raft_serverpb::RaftApplyState;
 use protobuf::Message;
 use rocksdb::{DBIterator, Writable, WriteBatch, WriteOptions, DB};
 
-use super::keys::{self, escape};
-use super::rocksdb_util::{self, CF_DEFAULT};
-use super::worker::{Runnable, Scheduler, Worker};
-
-pub struct Engine {
-    db: Arc<DB>,
-    apply: Worker<Task>,
-    applied_receiver: Option<UnboundedReceiver<CommandResponseBatch>>,
-}
-
-impl Engine {
-    pub fn new(db: Arc<DB>) -> Engine {
-        Engine {
-            db,
-            apply: Worker::new("apply"),
-            applied_receiver: None,
-        }
-    }
-
-    pub fn apply_scheduler(&self) -> Scheduler<Task> {
-        self.apply.scheduler()
-    }
-
-    pub fn start(&mut self) {
-        let (tx, rx) = unbounded();
-        self.applied_receiver = Some(rx);
-        let applier = ApplyWorker::new(self.db.clone(), tx);
-        self.apply.start(applier).unwrap();
-    }
-
-    pub fn take_apply_receiver(&mut self) -> Option<UnboundedReceiver<CommandResponseBatch>> {
-        self.applied_receiver.take()
-    }
-
-    pub fn stop(&mut self) {
-        if let Some(handler) = self.apply.stop() {
-            handler.join().unwrap()
-        }
-    }
-}
+use super::super::keys::{self, escape};
+use super::super::rocksdb_util::{self, CF_DEFAULT};
+use super::super::worker::Runnable;
 
 pub struct Task {
     commands: CommandRequestBatch,
@@ -70,7 +33,7 @@ impl fmt::Display for Task {
 
 const DEFAULT_APPLY_WB_SIZE: usize = 4 * 1024;
 
-struct ApplyWorker {
+pub struct Runner {
     db: Arc<DB>,
     notifier: UnboundedSender<CommandResponseBatch>,
 
@@ -78,9 +41,9 @@ struct ApplyWorker {
     wb: WriteBatch,
 }
 
-impl ApplyWorker {
-    fn new(db: Arc<DB>, notifier: UnboundedSender<CommandResponseBatch>) -> ApplyWorker {
-        let mut worker = ApplyWorker {
+impl Runner {
+    pub fn new(db: Arc<DB>, notifier: UnboundedSender<CommandResponseBatch>) -> Runner {
+        let mut worker = Runner {
             db,
             notifier,
             apply_states: HashMap::new(),
@@ -266,7 +229,7 @@ impl ApplyWorker {
     }
 }
 
-impl Runnable<Task> for ApplyWorker {
+impl Runnable<Task> for Runner {
     fn run_batch(&mut self, batch: &mut Vec<Task>) {
         for task in batch.drain(..) {
             self.apply_cmds(task.commands);
