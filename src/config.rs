@@ -20,7 +20,7 @@ use super::rocksdb_util::{CFOptions, CF_DEFAULT, CF_LOCK, CF_WRITE};
 #[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct RgConfig {
-    pub db_path: String,
+    pub path: String,
     pub address: String,
     pub rocksdb: DbConfig,
 }
@@ -49,7 +49,7 @@ impl RgConfig {
 impl Default for RgConfig {
     fn default() -> RgConfig {
         RgConfig {
-            db_path: "./data".to_owned(),
+            path: "./data".to_owned(),
             address: "127.0.0.1:3930".to_owned(),
             rocksdb: DbConfig::default(),
         }

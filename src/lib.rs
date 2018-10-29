@@ -10,6 +10,7 @@ extern crate toml;
 #[macro_use]
 extern crate log;
 extern crate byteorder;
+extern crate protobuf;
 
 pub mod config;
 pub mod engine;

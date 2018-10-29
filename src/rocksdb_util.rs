@@ -18,8 +18,8 @@ use rocksdb::load_latest_options;
 use rocksdb::rocksdb::supported_compression;
 use rocksdb::CFHandle;
 use rocksdb::{
-    CColumnFamilyDescriptor, ColumnFamilyOptions, CompactOptions, DBCompressionType, DBOptions,
-    Env, Range, SliceTransform, DB,
+    CColumnFamilyDescriptor, ColumnFamilyOptions, CompactOptions, DBCompressionType, DBIterator,
+    DBOptions, Env, ReadOptions, DB,
 };
 
 pub type CfName = &'static str;
@@ -247,91 +247,67 @@ pub fn auto_compactions_is_disabled(engine: &DB) -> bool {
     false
 }
 
-pub struct FixedSuffixSliceTransform {
-    pub suffix_len: usize,
-}
+pub fn scan_db_iterator<F>(
+    mut it: DBIterator<&DB>,
+    start_key: &[u8],
+    mut f: F,
+) -> Result<(), String>
+where
+    F: FnMut(&[u8], &[u8]) -> Result<bool, String>,
+{
+    it.seek(start_key.into());
+    while it.valid() {
+        let r = f(it.key(), it.value())?;
 
-impl FixedSuffixSliceTransform {
-    pub fn new(suffix_len: usize) -> FixedSuffixSliceTransform {
-        FixedSuffixSliceTransform { suffix_len }
-    }
-}
-
-impl SliceTransform for FixedSuffixSliceTransform {
-    fn transform<'a>(&mut self, key: &'a [u8]) -> &'a [u8] {
-        let mid = key.len() - self.suffix_len;
-        let (left, _) = key.split_at(mid);
-        left
-    }
-
-    fn in_domain(&mut self, key: &[u8]) -> bool {
-        key.len() >= self.suffix_len
-    }
-
-    fn in_range(&mut self, _: &[u8]) -> bool {
-        true
-    }
-}
-
-pub struct FixedPrefixSliceTransform {
-    pub prefix_len: usize,
-}
-
-impl FixedPrefixSliceTransform {
-    pub fn new(prefix_len: usize) -> FixedPrefixSliceTransform {
-        FixedPrefixSliceTransform { prefix_len }
-    }
-}
-
-impl SliceTransform for FixedPrefixSliceTransform {
-    fn transform<'a>(&mut self, key: &'a [u8]) -> &'a [u8] {
-        &key[..self.prefix_len]
-    }
-
-    fn in_domain(&mut self, key: &[u8]) -> bool {
-        key.len() >= self.prefix_len
-    }
-
-    fn in_range(&mut self, _: &[u8]) -> bool {
-        true
-    }
-}
-
-pub struct NoopSliceTransform;
-
-impl SliceTransform for NoopSliceTransform {
-    fn transform<'a>(&mut self, key: &'a [u8]) -> &'a [u8] {
-        key
-    }
-
-    fn in_domain(&mut self, _: &[u8]) -> bool {
-        true
-    }
-
-    fn in_range(&mut self, _: &[u8]) -> bool {
-        true
-    }
-}
-
-pub fn roughly_cleanup_ranges(db: &DB, ranges: &[(Vec<u8>, Vec<u8>)]) -> Result<(), String> {
-    let mut delete_ranges = Vec::new();
-    for &(ref start, ref end) in ranges {
-        if start == end {
-            continue;
+        if !r || !it.next() {
+            break;
         }
-        assert!(start < end);
-        delete_ranges.push(Range::new(start, end));
-    }
-    if delete_ranges.is_empty() {
-        return Ok(());
-    }
-
-    for cf in db.cf_names() {
-        let handle = get_cf_handle(db, cf)?;
-        db.delete_files_in_ranges_cf(handle, &delete_ranges, /* include_end */ false)?;
     }
 
     Ok(())
+}
+
+pub struct IterOption {
+    lower_bound: Option<Vec<u8>>,
+    upper_bound: Option<Vec<u8>>,
+    fill_cache: bool,
+}
+
+impl IterOption {
+    pub fn new(
+        lower_bound: Option<Vec<u8>>,
+        upper_bound: Option<Vec<u8>>,
+        fill_cache: bool,
+    ) -> IterOption {
+        IterOption {
+            lower_bound,
+            upper_bound,
+            fill_cache,
+        }
+    }
+
+    pub fn build_read_opts(&self) -> ReadOptions {
+        let mut opts = ReadOptions::new();
+        opts.fill_cache(self.fill_cache);
+        opts.set_total_order_seek(true);
+        if let Some(ref key) = self.lower_bound {
+            opts.set_iterate_lower_bound(key);
+        }
+        if let Some(ref key) = self.upper_bound {
+            opts.set_iterate_upper_bound(key);
+        }
+        opts
+    }
+}
+
+impl Default for IterOption {
+    fn default() -> IterOption {
+        IterOption {
+            lower_bound: None,
+            upper_bound: None,
+            fill_cache: true,
+        }
+    }
 }
 
 /// Compact the cf in the specified range by manual or not.

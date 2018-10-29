@@ -8,10 +8,11 @@ use kvproto::enginepb::{
 };
 use kvproto::raft_cmdpb::{CmdType, Request};
 use kvproto::raft_serverpb::RaftApplyState;
-use rocksdb::{Writable, WriteBatch, WriteOptions, DB};
+use protobuf::Message;
+use rocksdb::{DBIterator, Writable, WriteBatch, WriteOptions, DB};
 
 use super::keys::{self, escape};
-use super::rocksdb_util;
+use super::rocksdb_util::{self, CF_DEFAULT};
 use super::worker::{Runnable, Scheduler, Worker};
 
 pub struct Engine {
@@ -69,34 +70,65 @@ impl fmt::Display for Task {
 
 const DEFAULT_APPLY_WB_SIZE: usize = 4 * 1024;
 
-struct ApplyContext {
-    wb: WriteBatch,
-}
-
-impl ApplyContext {
-    fn new() -> ApplyContext {
-        ApplyContext {
-            wb: WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE),
-        }
-    }
-}
-
 struct ApplyWorker {
     db: Arc<DB>,
     notifier: UnboundedSender<CommandResponseBatch>,
 
     apply_states: HashMap<u64, RaftApplyState>,
-    apply_ctx: ApplyContext,
+    wb: WriteBatch,
 }
 
 impl ApplyWorker {
     fn new(db: Arc<DB>, notifier: UnboundedSender<CommandResponseBatch>) -> ApplyWorker {
-        ApplyWorker {
+        let mut worker = ApplyWorker {
             db,
             notifier,
             apply_states: HashMap::new(),
-            apply_ctx: ApplyContext::new(),
-        }
+            wb: WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE),
+        };
+
+        worker.restore_apply_states();
+        // Report apply states as soon as possible.
+        worker.report_apply_states();
+        worker
+    }
+
+    fn restore_apply_states(&mut self) {
+        // Scan region meta to get saved regions.
+        let start_key = keys::REGION_META_MIN_KEY;
+        let end_key = keys::REGION_META_MAX_KEY;
+
+        let iter_opt =
+            rocksdb_util::IterOption::new(Some(start_key.to_vec()), Some(end_key.to_vec()), false);
+        let handle = rocksdb_util::get_cf_handle(&self.db, CF_DEFAULT).unwrap();
+        let readopts = iter_opt.build_read_opts();
+        let iter = DBIterator::new_cf(self.db.as_ref(), handle, readopts);
+
+        let apply_states = &mut self.apply_states;
+        rocksdb_util::scan_db_iterator(iter, start_key, |key, value| {
+            let (region_id, suffix) = keys::decode_apply_state_key(key)?;
+            match suffix {
+                keys::APPLY_STATE_SUFFIX => {
+                    let state =
+                        protobuf::parse_from_bytes::<RaftApplyState>(value).unwrap_or_else(|e| {
+                            panic!(
+                                "[region {}] currupted apply state, key: {:?}, error: {:?}",
+                                region_id,
+                                escape(key),
+                                e
+                            )
+                        });
+                    apply_states.insert(region_id, state);
+                }
+                keys::SNAPSHOT_RAFT_STATE_SUFFIX => {
+                    // TODO: restore snapshot states.
+                }
+                _ => {
+                    warn!("unknown key: {:?}", escape(key));
+                }
+            }
+            Ok(true)
+        }).unwrap();
     }
 
     fn apply_cmds(&mut self, mut cmds: CommandRequestBatch) {
@@ -142,7 +174,7 @@ impl ApplyWorker {
         if !req.get_put().get_cf().is_empty() {
             let cf = req.get_put().get_cf();
             rocksdb_util::get_cf_handle(&self.db, cf)
-                .and_then(|handle| self.apply_ctx.wb.put_cf(handle, &key, value))
+                .and_then(|handle| self.wb.put_cf(handle, &key, value))
                 .unwrap_or_else(|e| {
                     panic!(
                         "[region {}] failed to write ({}, {}) to cf {}: {:?}",
@@ -154,7 +186,7 @@ impl ApplyWorker {
                     )
                 });
         } else {
-            self.apply_ctx.wb.put(&key, value).unwrap_or_else(|e| {
+            self.wb.put(&key, value).unwrap_or_else(|e| {
                 panic!(
                     "[region {}] failed to write ({}, {}): {:?}",
                     region_id,
@@ -174,7 +206,7 @@ impl ApplyWorker {
             let cf = req.get_delete().get_cf();
             // TODO: check whether cf exists or not.
             rocksdb_util::get_cf_handle(&self.db, cf)
-                .and_then(|handle| self.apply_ctx.wb.delete_cf(handle, &key))
+                .and_then(|handle| self.wb.delete_cf(handle, &key))
                 .unwrap_or_else(|e| {
                     panic!(
                         "[region {}] failed to delete {}: {:?}",
@@ -184,7 +216,7 @@ impl ApplyWorker {
                     )
                 });
         } else {
-            self.apply_ctx.wb.delete(&key).unwrap_or_else(|e| {
+            self.wb.delete(&key).unwrap_or_else(|e| {
                 panic!(
                     "[region {}] failed to delete {}: {:?}",
                     region_id,
@@ -193,6 +225,29 @@ impl ApplyWorker {
                 )
             });
         }
+    }
+
+    fn persist_apply(&mut self) {
+        let mut buffer = Vec::new();
+        for (region_id, applied_state) in &self.apply_states {
+            applied_state.write_to_writer(&mut buffer).unwrap();
+            let region_key = keys::apply_state_key(*region_id);
+            self.wb.put(&region_key, &buffer).unwrap_or_else(|e| {
+                panic!(
+                    "[region {}] failed to delete {}: {:?}",
+                    region_id,
+                    escape(&region_key),
+                    e
+                )
+            });
+        }
+        let mut write_opts = WriteOptions::new();
+        write_opts.set_sync(true /* TODO: consider header.sync_log */);
+        let mut wb = WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE);
+        ::std::mem::swap(&mut self.wb, &mut wb);
+        self.db.write_opt(wb, &write_opts).unwrap_or_else(|e| {
+            panic!("failed to write to engine: {:?}", e);
+        });
     }
 
     fn report_apply_states(&self) {
@@ -219,14 +274,7 @@ impl Runnable<Task> for ApplyWorker {
     }
 
     fn on_tick(&mut self) {
-        let mut write_opts = WriteOptions::new();
-        write_opts.set_sync(true /* TODO: consider header.sync_log */);
-        let mut wb = WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE);
-        ::std::mem::swap(&mut self.apply_ctx.wb, &mut wb);
-        self.db.write_opt(wb, &write_opts).unwrap_or_else(|e| {
-            panic!("failed to write to engine: {:?}", e);
-        });
-
+        self.persist_apply();
         self.report_apply_states();
     }
 
