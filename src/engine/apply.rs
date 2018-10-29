@@ -88,6 +88,7 @@ impl Runner {
                                 e
                             )
                         });
+                    info!("[region {}] restore apply state {:?}", region_id, state);
                     apply_states.insert(region_id, state);
                 }
                 keys::SNAPSHOT_RAFT_STATE_SUFFIX => {
@@ -198,6 +199,7 @@ impl Runner {
     }
 
     fn persist_apply(&mut self) {
+        info!("persist apply state, total: {}", self.apply_states.len());
         let mut buffer = Vec::new();
         for (region_id, applied_state) in &self.apply_states {
             applied_state.write_to_writer(&mut buffer).unwrap();
@@ -221,6 +223,7 @@ impl Runner {
     }
 
     fn report_apply_states(&self) {
+        info!("report apply state, total: {}", self.apply_states.len());
         let mut resps = Vec::with_capacity(self.apply_states.len());
         for (region_id, applied_state) in &self.apply_states {
             let mut header = CommandResponseHeader::new();
@@ -246,6 +249,10 @@ impl Runnable<Task> for Runner {
                 Task::Snapshot { mut state } => {
                     let region_id = state.get_region().get_id();
                     let apply_state = state.take_apply_state();
+                    info!(
+                        "[region {}] update apply state via snapshot {:?}",
+                        region_id, apply_state
+                    );
                     self.apply_states.insert(region_id, apply_state);
                 }
             }

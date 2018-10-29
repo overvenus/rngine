@@ -45,6 +45,7 @@ impl Engine {
 
         let snap_runner = SnapshotRunner::new(self.db.clone(), self.apply_worker.scheduler());
         self.snapshot_worker.start(snap_runner).unwrap();
+        info!("Welcome to Rng");
     }
 
     pub fn take_apply_receiver(&mut self) -> Option<UnboundedReceiver<CommandResponseBatch>> {

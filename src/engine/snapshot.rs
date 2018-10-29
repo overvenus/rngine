@@ -64,7 +64,9 @@ impl Runner {
             };
 
             if state.is_none() {
-                state = Some(chunk.take_state());
+                let s = chunk.take_state();
+                info!("applying snapshot, {:?}", s);
+                state = Some(s);
                 continue;
             }
 
@@ -105,7 +107,7 @@ impl Runner {
             )
         });
         let mut write_opts = WriteOptions::new();
-        write_opts.set_sync(true /* TODO: consider header.sync_log */);
+        write_opts.set_sync(true);
         self.db.write_opt(wb, &write_opts).unwrap_or_else(|e| {
             panic!("failed to write to engine: {:?}", e);
         });
@@ -118,12 +120,14 @@ impl Runner {
 
         // Notify apply snapshot finished.
         done.send(()).unwrap();
+        info!("[region {}] snapshot applied", region_id);
     }
 }
 
 impl Runnable<Task> for Runner {
     fn run_batch(&mut self, batch: &mut Vec<Task>) {
         for task in batch.drain(..) {
+            info!("receive a snapshot");
             self.apply_snapshot(task);
         }
     }
