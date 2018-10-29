@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process;
 use std::sync::Arc;
 
-use clap::{App, Arg};
+use clap::{App, Arg, ArgMatches};
 use fs2::FileExt;
 
 use rngine::config::RgConfig;
@@ -38,6 +38,14 @@ fn main() {
                 .value_name("IP:PORT")
                 .help("Sets listening address"),
         ).arg(
+            Arg::with_name("data-dir")
+                .long("data-dir")
+                .short("s")
+                .alias("store")
+                .takes_value(true)
+                .value_name("PATH")
+                .help("Sets the path to store directory"),
+        ).arg(
             Arg::with_name("print-sample-config")
                 .long("print-sample-config")
                 .help("Print a sample config to stdout"),
@@ -48,9 +56,10 @@ fn main() {
         println!("{}", toml::to_string_pretty(&config).unwrap());
         process::exit(0);
     }
-    let config = matches
+    let mut config = matches
         .value_of("config")
         .map_or_else(RgConfig::default, |path| RgConfig::from_file(&path));
+    overwrite_config_with_cmd_args(&mut config, &matches);
 
     // Install logger.
     let env = env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info");
@@ -108,5 +117,15 @@ fn handle_signal() {
             }
             _ => unreachable!(),
         }
+    }
+}
+
+fn overwrite_config_with_cmd_args(config: &mut RgConfig, matches: &ArgMatches) {
+    if let Some(addr) = matches.value_of("addr") {
+        config.address = addr.to_owned();
+    }
+
+    if let Some(data_dir) = matches.value_of("data-dir") {
+        config.path = data_dir.to_owned();
     }
 }
