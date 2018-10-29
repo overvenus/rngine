@@ -5,6 +5,7 @@ use std::sync::Arc;
 use futures::sync::mpsc::UnboundedSender;
 use kvproto::enginepb::{
     CommandRequestBatch, CommandResponse, CommandResponseBatch, CommandResponseHeader,
+    SnapshotState,
 };
 use kvproto::raft_cmdpb::{CmdType, Request};
 use kvproto::raft_serverpb::RaftApplyState;
@@ -15,13 +16,18 @@ use super::super::keys::{self, escape};
 use super::super::rocksdb_util::{self, CF_DEFAULT};
 use super::super::worker::Runnable;
 
-pub struct Task {
-    commands: CommandRequestBatch,
+pub enum Task {
+    Commands { commands: CommandRequestBatch },
+    Snapshot { state: SnapshotState },
 }
 
 impl Task {
-    pub fn new(commands: CommandRequestBatch) -> Task {
-        Task { commands }
+    pub fn commands(commands: CommandRequestBatch) -> Task {
+        Task::Commands { commands }
+    }
+
+    pub fn snapshot(state: SnapshotState) -> Task {
+        Task::Snapshot { state }
     }
 }
 
@@ -37,6 +43,7 @@ pub struct Runner {
     db: Arc<DB>,
     notifier: UnboundedSender<CommandResponseBatch>,
 
+    // region id -> apply state
     apply_states: HashMap<u64, RaftApplyState>,
     wb: WriteBatch,
 }
@@ -232,7 +239,16 @@ impl Runner {
 impl Runnable<Task> for Runner {
     fn run_batch(&mut self, batch: &mut Vec<Task>) {
         for task in batch.drain(..) {
-            self.apply_cmds(task.commands);
+            match task {
+                Task::Commands { commands } => {
+                    self.apply_cmds(commands);
+                }
+                Task::Snapshot { mut state } => {
+                    let region_id = state.get_region().get_id();
+                    let apply_state = state.take_apply_state();
+                    self.apply_states.insert(region_id, apply_state);
+                }
+            }
         }
     }
 

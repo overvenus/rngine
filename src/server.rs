@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use futures::sync::mpsc::UnboundedReceiver;
+use futures::sync::oneshot;
 use futures::{Future, Sink, Stream};
 use grpcio::{
     ClientStreamingSink, DuplexSink, EnvBuilder, Environment, RequestStream, RpcContext,
@@ -12,13 +13,15 @@ use grpcio::{
 use kvproto::enginepb::{CommandRequestBatch, CommandResponseBatch, SnapshotDone, SnapshotRequest};
 use kvproto::enginepb_grpc::*;
 
-use super::engine::{ApplyTask, Engine as Rngine};
+use super::engine::{ApplyTask, Engine as Rngine, SnapshotTask};
 use super::worker::Scheduler;
 
 #[derive(Clone)]
 pub struct Service {
     apply: Scheduler<ApplyTask>,
     applied_receiver: Arc<Mutex<Option<UnboundedReceiver<CommandResponseBatch>>>>,
+
+    snapshot: Scheduler<SnapshotTask>,
 }
 
 impl Service {
@@ -26,6 +29,7 @@ impl Service {
         Service {
             apply: rg.apply_scheduler(),
             applied_receiver: Arc::new(Mutex::new(rg.take_apply_receiver())),
+            snapshot: rg.snapshot_scheduler(),
         }
     }
 }
@@ -40,7 +44,7 @@ impl Engine for Service {
         let apply = self.apply.clone();
         let reqs = stream
             .for_each(move |cmds| {
-                apply.schedule(ApplyTask::new(cmds)).unwrap();
+                apply.schedule(ApplyTask::commands(cmds)).unwrap();
                 Ok(())
             }).map_err(|e| {
                 error!("{:?}", e);
@@ -65,11 +69,27 @@ impl Engine for Service {
 
     fn apply_snapshot(
         &mut self,
-        _ctx: RpcContext,
-        _stream: RequestStream<SnapshotRequest>,
-        _sink: ClientStreamingSink<SnapshotDone>,
+        ctx: RpcContext,
+        stream: RequestStream<SnapshotRequest>,
+        sink: ClientStreamingSink<SnapshotDone>,
     ) {
-        unimplemented!()
+        let (tx, rx) = oneshot::channel();
+        let (sender, task) = SnapshotTask::new(tx);
+        let reqs = stream
+            .for_each(move |chunk| {
+                sender.send(chunk).unwrap();
+                Ok(())
+            }).map_err(|e| {
+                error!("{:?}", e);
+            });
+
+        let resp = rx
+            .then(move |_| sink.success(Default::default()))
+            .map_err(|e| error!("{:?}", e));
+
+        self.snapshot.schedule(task).unwrap();
+        ctx.spawn(reqs);
+        ctx.spawn(resp);
     }
 }
 
