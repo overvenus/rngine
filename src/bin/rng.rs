@@ -1,5 +1,6 @@
 #[macro_use]
 extern crate log;
+extern crate backtrace;
 extern crate clap;
 extern crate env_logger;
 extern crate nix;
@@ -8,8 +9,8 @@ extern crate signal;
 
 use std::fs::{self, File};
 use std::path::Path;
-use std::process;
 use std::sync::Arc;
+use std::{panic, process, thread};
 
 use clap::{App, Arg, ArgMatches};
 use fs2::FileExt;
@@ -64,6 +65,9 @@ fn main() {
     // Install logger.
     let env = env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info");
     env_logger::Builder::from_env(env).init();
+
+    // Install panic hook. Abort on panic.
+    set_panic_hook(true);
 
     let root_path = Path::new(&config.path);
     // Create root directory if missing.
@@ -128,4 +132,56 @@ fn overwrite_config_with_cmd_args(config: &mut RgConfig, matches: &ArgMatches) {
     if let Some(data_dir) = matches.value_of("data-dir") {
         config.path = data_dir.to_owned();
     }
+}
+
+// Exit the whole process when panic.
+fn set_panic_hook(panic_abort: bool) {
+    // HACK! New a backtrace ahead for caching necessary elf sections of this
+    // tikv-server, in case it can not open more files during panicking
+    // which leads to no stack info (0x5648bdfe4ff2 - <no info>).
+    //
+    // Crate backtrace caches debug info in a static variable `STATE`,
+    // and the `STATE` lives forever once it has been created.
+    // See more: https://github.com/alexcrichton/backtrace-rs/blob/\
+    //           597ad44b131132f17ed76bf94ac489274dd16c7f/\
+    //           src/symbolize/libbacktrace.rs#L126-L159
+    // Caching is slow, spawn it in another thread to speed up.
+    thread::Builder::new()
+        .name("backtrace-loader".to_owned())
+        .spawn(::backtrace::Backtrace::new)
+        .unwrap();
+
+    let orig_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info: &panic::PanicInfo| {
+        if log_enabled!(::log::LogLevel::Error) {
+            let msg = match info.payload().downcast_ref::<&'static str>() {
+                Some(s) => *s,
+                None => match info.payload().downcast_ref::<String>() {
+                    Some(s) => &s[..],
+                    None => "Box<Any>",
+                },
+            };
+            let thread = thread::current();
+            let name = thread.name().unwrap_or("<unnamed>");
+            let loc = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()));
+            let bt = ::backtrace::Backtrace::new();
+            error!(
+                "thread '{}' panicked '{}' at {:?}\n{:?}",
+                name,
+                msg,
+                loc.unwrap_or_else(|| "<unknown>".to_owned()),
+                bt
+            );
+        } else {
+            orig_hook(info);
+        }
+
+        if panic_abort {
+            process::abort();
+        } else {
+            process::exit(1);
+        }
+    }))
 }
