@@ -4,13 +4,12 @@ use std::sync::Arc;
 
 use futures::sync::oneshot::Sender as OneshotSender;
 use kvproto::enginepb::{SnapshotRequest, SnapshotState};
-use protobuf::Message;
 use rocksdb::{Writable, WriteBatch, WriteOptions, DB};
 
 use super::super::keys::{self, escape};
 use super::super::rocksdb_util;
 use super::super::worker::{Runnable, Scheduler};
-use super::ApplyTask;
+use super::{ApplyState, ApplyTask};
 
 pub struct Task {
     requests: Receiver<SnapshotRequest>,
@@ -56,7 +55,7 @@ impl Runner {
                 Ok(chunk) => chunk,
                 Err(RecvError) => {
                     info!(
-                        "[region {}] receive all snapshot",
+                        "[region {}] receive all snapshot chunks",
                         state.as_ref().unwrap().get_region().get_id(),
                     );
                     break;
@@ -92,15 +91,16 @@ impl Runner {
         // Persist snapshot data.
         let region_id = state.as_ref().unwrap().get_region().get_id();
         let snapshot_state = state.unwrap();
+
         let mut buffer = Vec::new();
-        snapshot_state
-            .get_apply_state()
-            .write_to_writer(&mut buffer)
-            .unwrap();
+        let raft_apply_state = snapshot_state.get_apply_state();
+        let apply_state = ApplyState::from_raft_apply_state(raft_apply_state.clone());
+        apply_state.write_to(&mut buffer).unwrap();
+
         let region_key = keys::apply_state_key(region_id);
         wb.put(&region_key, &buffer).unwrap_or_else(|e| {
             panic!(
-                "[region {}] failed to delete {}: {:?}",
+                "[region {}] failed to apply snapshot {}: {:?}",
                 region_id,
                 escape(&region_key),
                 e

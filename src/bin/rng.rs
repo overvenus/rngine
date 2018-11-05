@@ -31,14 +31,16 @@ fn main() {
                 .value_name("FILE")
                 .help("Sets config file")
                 .takes_value(true),
-        ).arg(
+        )
+        .arg(
             Arg::with_name("addr")
                 .short("A")
                 .long("addr")
                 .takes_value(true)
                 .value_name("IP:PORT")
                 .help("Sets listening address"),
-        ).arg(
+        )
+        .arg(
             Arg::with_name("data-dir")
                 .long("data-dir")
                 .short("s")
@@ -46,11 +48,13 @@ fn main() {
                 .takes_value(true)
                 .value_name("PATH")
                 .help("Sets the path to store directory"),
-        ).arg(
+        )
+        .arg(
             Arg::with_name("print-sample-config")
                 .long("print-sample-config")
                 .help("Print a sample config to stdout"),
-        ).get_matches();
+        )
+        .get_matches();
 
     if matches.is_present("print-sample-config") {
         let config = RgConfig::default();
@@ -65,6 +69,8 @@ fn main() {
     // Install logger.
     let env = env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info");
     env_logger::Builder::from_env(env).init();
+
+    info!("Welcome to Rng");
 
     // Install panic hook. Abort on panic.
     set_panic_hook(true);
