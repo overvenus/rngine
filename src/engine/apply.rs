@@ -103,6 +103,51 @@ impl Runner {
         .unwrap();
     }
 
+    fn persist_apply(&mut self) {
+        info!("persist apply state, total: {}", self.apply_states.len());
+        let mut buffer = Vec::new();
+        for (region_id, applied_state) in &self.apply_states {
+            applied_state.write_to(&mut buffer).unwrap();
+            let apply_state_key = keys::apply_state_key(*region_id);
+            self.wb.put(&apply_state_key, &buffer).unwrap_or_else(|e| {
+                panic!(
+                    "[region {}] failed to apply state {}: {:?}",
+                    region_id,
+                    escape(&apply_state_key),
+                    e
+                )
+            });
+
+            // To write next region's apply state, we need to clear the buffer.
+            buffer.clear();
+        }
+        let mut write_opts = WriteOptions::new();
+        write_opts.set_sync(true /* TODO: consider header.sync_log */);
+        let mut wb = WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE);
+        ::std::mem::swap(&mut self.wb, &mut wb);
+        self.db.write_opt(wb, &write_opts).unwrap_or_else(|e| {
+            panic!("failed to write to engine: {:?}", e);
+        });
+    }
+
+    fn report_apply_states(&self) {
+        info!("report apply state, total: {}", self.apply_states.len());
+        let mut resps = Vec::with_capacity(self.apply_states.len());
+        for (region_id, state) in &self.apply_states {
+            debug!("[region {}] reports apply state {:?}", region_id, state);
+            let mut header = CommandResponseHeader::new();
+            header.set_region_id(*region_id);
+            let mut resp = CommandResponse::new();
+            resp.set_header(header);
+            resp.set_apply_state(state.state.clone());
+            resp.set_applied_term(state.applied_term);
+            resps.push(resp);
+        }
+        let mut resps_batch = CommandResponseBatch::new();
+        resps_batch.set_responses(resps.into());
+        self.notifier.unbounded_send(resps_batch).unwrap();
+    }
+
     fn apply_cmds(&mut self, mut cmds: CommandRequestBatch) {
         for mut cmd in cmds.take_requests().into_vec() {
             assert!(cmd.has_header());
@@ -204,51 +249,6 @@ impl Runner {
                 )
             });
         }
-    }
-
-    fn persist_apply(&mut self) {
-        info!("persist apply state, total: {}", self.apply_states.len());
-        let mut buffer = Vec::new();
-        for (region_id, applied_state) in &self.apply_states {
-            applied_state.write_to(&mut buffer).unwrap();
-            let apply_state_key = keys::apply_state_key(*region_id);
-            self.wb.put(&apply_state_key, &buffer).unwrap_or_else(|e| {
-                panic!(
-                    "[region {}] failed to apply state {}: {:?}",
-                    region_id,
-                    escape(&apply_state_key),
-                    e
-                )
-            });
-
-            // To write next region's apply state, we need to clear the buffer.
-            buffer.clear();
-        }
-        let mut write_opts = WriteOptions::new();
-        write_opts.set_sync(true /* TODO: consider header.sync_log */);
-        let mut wb = WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE);
-        ::std::mem::swap(&mut self.wb, &mut wb);
-        self.db.write_opt(wb, &write_opts).unwrap_or_else(|e| {
-            panic!("failed to write to engine: {:?}", e);
-        });
-    }
-
-    fn report_apply_states(&self) {
-        info!("report apply state, total: {}", self.apply_states.len());
-        let mut resps = Vec::with_capacity(self.apply_states.len());
-        for (region_id, state) in &self.apply_states {
-            debug!("[region {}] reports apply state {:?}", region_id, state);
-            let mut header = CommandResponseHeader::new();
-            header.set_region_id(*region_id);
-            let mut resp = CommandResponse::new();
-            resp.set_header(header);
-            resp.set_apply_state(state.state.clone());
-            resp.set_applied_term(state.applied_term);
-            resps.push(resp);
-        }
-        let mut resps_batch = CommandResponseBatch::new();
-        resps_batch.set_responses(resps.into());
-        self.notifier.unbounded_send(resps_batch).unwrap();
     }
 }
 

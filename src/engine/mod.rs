@@ -27,8 +27,8 @@ impl Engine {
     pub fn new(db: Arc<DB>) -> Engine {
         Engine {
             db,
-            apply_worker: Worker::new("apply"),
-            snapshot_worker: Worker::new("snapshot"),
+            apply_worker: Worker::new("apply-worker"),
+            snapshot_worker: Worker::new("snapshot-worker"),
             applied_receiver: None,
         }
     }
