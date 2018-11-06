@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::sync::mpsc::UnboundedSender;
 use kvproto::enginepb::{
@@ -12,7 +13,7 @@ use rocksdb::{DBIterator, Writable, WriteBatch, WriteOptions, DB};
 
 use super::super::keys::{self, escape};
 use super::super::rocksdb_util::{self, CF_DEFAULT};
-use super::super::worker::Runnable;
+use super::super::worker::{Runnable, RunnableWithTimer, Timer};
 use super::ApplyState;
 
 pub enum Task {
@@ -60,6 +61,14 @@ impl Runner {
         // Report apply states as soon as possible.
         worker.report_apply_states();
         worker
+    }
+
+    pub fn timer(&self) -> Timer<()> {
+        let mut timer = Timer::new(1);
+
+        // report every 5 scends.
+        timer.add_task(Duration::from_secs(5), ());
+        timer
     }
 
     fn restore_apply_states(&mut self) {
@@ -264,12 +273,19 @@ impl Runnable<Task> for Runner {
         }
     }
 
-    fn on_tick(&mut self) {
-        self.persist_apply();
-        self.report_apply_states();
-    }
+    fn on_tick(&mut self) {}
 
     fn shutdown(&mut self) {
         self.on_tick();
+    }
+}
+
+impl RunnableWithTimer<Task, ()> for Runner {
+    fn on_timeout(&mut self, timer: &mut Timer<()>, _: ()) {
+        self.persist_apply();
+        self.report_apply_states();
+
+        // report every 5 scends.
+        timer.add_task(Duration::from_secs(5), ());
     }
 }

@@ -11,13 +11,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// Worker contains all workers that do the expensive job in background.
 use std::fmt::{self, Debug, Display, Formatter};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SendError, Sender, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{
+    self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
+};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, Builder as ThreadBuilder, JoinHandle};
-/// Worker contains all workers that do the expensive job in background.
+use std::time::{Duration, Instant};
 use std::{io, usize};
+
+mod timer;
+
+pub use self::timer::Timer;
 
 #[derive(Eq, PartialEq)]
 pub enum ScheduleError<T> {
@@ -63,6 +70,28 @@ pub trait Runnable<T: Display> {
     fn shutdown(&mut self) {}
 }
 
+pub trait RunnableWithTimer<T: Display, U>: Runnable<T> {
+    fn on_timeout(&mut self, timer: &mut Timer<U>, event: U);
+}
+
+struct DefaultRunnerWithTimer<R>(R);
+
+impl<T: Display, R: Runnable<T>> Runnable<T> for DefaultRunnerWithTimer<R> {
+    fn run_batch(&mut self, ts: &mut Vec<T>) {
+        self.0.run_batch(ts)
+    }
+    fn on_tick(&mut self) {
+        self.0.on_tick()
+    }
+    fn shutdown(&mut self) {
+        self.0.shutdown()
+    }
+}
+
+impl<T: Display, R: Runnable<T>> RunnableWithTimer<T, ()> for DefaultRunnerWithTimer<R> {
+    fn on_timeout(&mut self, _: &mut Timer<()>, _: ()) {}
+}
+
 enum TaskSender<T> {
     Bounded(SyncSender<Option<T>>),
     Unbounded(Sender<Option<T>>),
@@ -73,6 +102,17 @@ impl<T> Clone for TaskSender<T> {
         match *self {
             TaskSender::Bounded(ref tx) => TaskSender::Bounded(tx.clone()),
             TaskSender::Unbounded(ref tx) => TaskSender::Unbounded(tx.clone()),
+        }
+    }
+}
+
+impl<T> TaskSender<T> {
+    fn try_send(&self, t: Option<T>) -> Result<(), TrySendError<Option<T>>> {
+        match self {
+            TaskSender::Bounded(ref sender) => sender.try_send(t),
+            TaskSender::Unbounded(ref sender) => {
+                sender.send(t).map_err(|e| TrySendError::Disconnected(e.0))
+            }
         }
     }
 }
@@ -101,18 +141,13 @@ impl<T: Display> Scheduler<T> {
     /// If the worker is stopped or number pending tasks exceeds capacity, an error will return.
     pub fn schedule(&self, task: T) -> Result<(), ScheduleError<T>> {
         debug!("scheduling task {}", task);
-        match self.sender {
-            TaskSender::Unbounded(ref tx) => if let Err(SendError(Some(t))) = tx.send(Some(task)) {
-                return Err(ScheduleError::Stopped(t));
-            },
-            TaskSender::Bounded(ref tx) => if let Err(e) = tx.try_send(Some(task)) {
-                match e {
-                    TrySendError::Disconnected(Some(t)) => return Err(ScheduleError::Stopped(t)),
-                    TrySendError::Full(Some(t)) => return Err(ScheduleError::Full(t)),
-                    _ => unreachable!(),
-                }
-            },
-        };
+        if let Err(e) = self.sender.try_send(Some(task)) {
+            match e {
+                TrySendError::Disconnected(Some(t)) => return Err(ScheduleError::Stopped(t)),
+                TrySendError::Full(Some(t)) => return Err(ScheduleError::Full(t)),
+                _ => unreachable!(),
+            }
+        }
         self.counter.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -182,7 +217,7 @@ impl<S: Into<String>> Builder<S> {
         };
 
         Worker {
-            scheduler: scheduler,
+            scheduler,
             receiver: Mutex::new(Some(rx)),
             handle: None,
             batch_size: self.batch_size,
@@ -198,44 +233,73 @@ pub struct Worker<T: Display> {
     batch_size: usize,
 }
 
-fn poll<R, T>(mut runner: R, rx: Receiver<Option<T>>, counter: Arc<AtomicUsize>, batch_size: usize)
-where
-    R: Runnable<T> + Send + 'static,
+fn poll<R, T, U>(
+    mut runner: R,
+    rx: Receiver<Option<T>>,
+    counter: Arc<AtomicUsize>,
+    batch_size: usize,
+    mut timer: Timer<U>,
+) where
+    R: RunnableWithTimer<T, U> + Send + 'static,
     T: Display + Send + 'static,
+    U: Send + 'static,
 {
     let mut batch = Vec::with_capacity(batch_size);
     let mut keep_going = true;
+    let mut tick_time = None;
     while keep_going {
-        keep_going = fill_task_batch(&rx, &mut batch, batch_size);
-        let should_tick = !batch.is_empty();
+        tick_time = tick_time.or_else(|| timer.next_timeout());
+        let timeout = tick_time.map(|t| t.duration_since(Instant::now()));
+
+        keep_going = fill_task_batch(&rx, &mut batch, batch_size, timeout);
         if !batch.is_empty() {
-            counter.fetch_sub(batch.len(), Ordering::SeqCst);
+            // batch will be cleared after `run_batch`, so we need to store its length
+            // before `run_batch`.
+            let batch_len = batch.len();
             runner.run_batch(&mut batch);
+            counter.fetch_sub(batch_len, Ordering::SeqCst);
             batch.clear();
         }
-        if should_tick {
-            runner.on_tick();
+
+        if tick_time.is_some() {
+            let now = Instant::now();
+            while let Some(task) = timer.pop_task_before(now) {
+                runner.on_timeout(&mut timer, task);
+                tick_time = None;
+            }
         }
+        runner.on_tick();
     }
     runner.shutdown();
 }
 
 // Fill buffer with next task batch comes from `rx`.
-fn fill_task_batch<T>(rx: &Receiver<Option<T>>, buffer: &mut Vec<T>, batch_size: usize) -> bool {
-    match rx.recv() {
-        Ok(Some(task)) => {
-            buffer.push(task);
-            while buffer.len() < batch_size {
-                match rx.try_recv() {
-                    Ok(Some(t)) => buffer.push(t),
-                    Err(TryRecvError::Empty) => break,
-                    Ok(None) | Err(_) => return false,
-                }
-            }
-            true
+fn fill_task_batch<T>(
+    rx: &Receiver<Option<T>>,
+    buffer: &mut Vec<T>,
+    batch_size: usize,
+    timeout: Option<Duration>,
+) -> bool {
+    let head_task = match timeout {
+        Some(dur) => match rx.recv_timeout(dur) {
+            Err(RecvTimeoutError::Timeout) => return true,
+            Err(RecvTimeoutError::Disconnected) | Ok(None) => return false,
+            Ok(Some(task)) => task,
+        },
+        None => match rx.recv() {
+            Err(_) | Ok(None) => return false,
+            Ok(Some(task)) => task,
+        },
+    };
+    buffer.push(head_task);
+    while buffer.len() < batch_size {
+        match rx.try_recv() {
+            Ok(Some(t)) => buffer.push(t),
+            Err(TryRecvError::Empty) => return true,
+            Err(_) | Ok(None) => return false,
         }
-        _ => false,
     }
+    true
 }
 
 impl<T: Display + Send + 'static> Worker<T> {
@@ -245,9 +309,16 @@ impl<T: Display + Send + 'static> Worker<T> {
     }
 
     /// Start the worker.
-    pub fn start<R>(&mut self, runner: R) -> Result<(), io::Error>
+    pub fn start<R: Runnable<T> + Send + 'static>(&mut self, runner: R) -> Result<(), io::Error> {
+        let runner = DefaultRunnerWithTimer(runner);
+        let timer: Timer<()> = Timer::new(0);
+        self.start_with_timer(runner, timer)
+    }
+
+    pub fn start_with_timer<R, U>(&mut self, runner: R, timer: Timer<U>) -> Result<(), io::Error>
     where
-        R: Runnable<T> + Send + 'static,
+        R: RunnableWithTimer<T, U> + Send + 'static,
+        U: Send + 'static,
     {
         let mut receiver = self.receiver.lock().unwrap();
         info!("starting working thread: {}", self.scheduler.name);
@@ -257,11 +328,11 @@ impl<T: Display + Send + 'static> Worker<T> {
         }
 
         let rx = receiver.take().unwrap();
-        let counter = self.scheduler.counter.clone();
+        let counter = Arc::clone(&self.scheduler.counter);
         let batch_size = self.batch_size;
         let h = ThreadBuilder::new()
-            .name(String::clone(&self.scheduler.name))
-            .spawn(move || poll(runner, rx, counter, batch_size))?;
+            .name(self.scheduler.name.to_string())
+            .spawn(move || poll(runner, rx, counter, batch_size, timer))?;
         self.handle = Some(h);
         Ok(())
     }
@@ -291,17 +362,11 @@ impl<T: Display + Send + 'static> Worker<T> {
     pub fn stop(&mut self) -> Option<thread::JoinHandle<()>> {
         // close sender explicitly so the background thread will exit.
         info!("stoping {}", self.scheduler.name);
-        if self.handle.is_none() {
-            return None;
-        }
-        let send_result = match self.scheduler.sender {
-            TaskSender::Unbounded(ref tx) => tx.send(None),
-            TaskSender::Bounded(ref tx) => tx.send(None),
-        };
-        if let Err(e) = send_result {
+        let handle = self.handle.take()?;
+        if let Err(e) = self.scheduler.sender.try_send(None) {
             warn!("failed to stop worker thread: {:?}", e);
         }
-        self.handle.take()
+        Some(handle)
     }
 }
 

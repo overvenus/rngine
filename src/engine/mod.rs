@@ -44,8 +44,11 @@ impl Engine {
     pub fn start(&mut self) {
         let (tx, rx) = unbounded();
         self.applied_receiver = Some(rx);
-        let applier = ApplyRunner::new(self.db.clone(), tx);
-        self.apply_worker.start(applier).unwrap();
+        let apply_runner = ApplyRunner::new(self.db.clone(), tx);
+        let apply_timer = apply_runner.timer();
+        self.apply_worker
+            .start_with_timer(apply_runner, apply_timer)
+            .unwrap();
 
         let snap_runner = SnapshotRunner::new(self.db.clone(), self.apply_worker.scheduler());
         self.snapshot_worker.start(snap_runner).unwrap();
