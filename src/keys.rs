@@ -37,17 +37,15 @@ pub const DATA_MAX_KEY: &[u8] = &[DATA_PREFIX + 1];
 // with different prefixes.
 const REGION_RAFT_PREFIX: u8 = 0x02;
 const REGION_RAFT_PREFIX_KEY: &[u8] = &[LOCAL_PREFIX, REGION_RAFT_PREFIX];
-const REGION_META_PREFIX: u8 = 0x03;
-// const REGION_META_PREFIX_KEY: &[u8] = &[LOCAL_PREFIX, REGION_META_PREFIX];
-pub const REGION_META_MIN_KEY: &[u8] = &[LOCAL_PREFIX, REGION_META_PREFIX];
-pub const REGION_META_MAX_KEY: &[u8] = &[LOCAL_PREFIX, REGION_META_PREFIX + 1];
+pub const REGION_RAFT_MIN_KEY: &[u8] = &[LOCAL_PREFIX, REGION_RAFT_PREFIX];
+pub const REGION_RAFT_MAX_KEY: &[u8] = &[LOCAL_PREFIX, REGION_RAFT_PREFIX + 1];
 
 // Following are the suffix after the local prefix.
 // For region id
 // const RAFT_LOG_SUFFIX: u8 = 0x01;
 // const RAFT_STATE_SUFFIX: u8 = 0x02;
 pub const APPLY_STATE_SUFFIX: u8 = 0x03;
-pub const SNAPSHOT_RAFT_STATE_SUFFIX: u8 = 0x04;
+// pub const SNAPSHOT_RAFT_STATE_SUFFIX: u8 = 0x04;
 
 // For region meta
 pub const REGION_STATE_SUFFIX: u8 = 0x01;
@@ -61,10 +59,6 @@ fn make_region_prefix(region_id: u64, suffix: u8) -> [u8; 11] {
     BigEndian::write_u64(&mut key[2..10], region_id);
     key[10] = suffix;
     key
-}
-
-pub fn snapshot_raft_state_key(region_id: u64) -> [u8; 11] {
-    make_region_prefix(region_id, SNAPSHOT_RAFT_STATE_SUFFIX)
 }
 
 pub fn apply_state_key(region_id: u64) -> [u8; 11] {

@@ -45,7 +45,9 @@ pub struct Runner {
 
     // region id -> apply state
     apply_states: HashMap<u64, ApplyState>,
+
     wb: WriteBatch,
+    pending_write_and_report: bool,
 }
 
 impl Runner {
@@ -55,6 +57,7 @@ impl Runner {
             notifier,
             apply_states: HashMap::new(),
             wb: WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE),
+            pending_write_and_report: false,
         };
 
         worker.restore_apply_states();
@@ -73,8 +76,8 @@ impl Runner {
 
     fn restore_apply_states(&mut self) {
         // Scan region meta to get saved regions.
-        let start_key = keys::REGION_META_MIN_KEY;
-        let end_key = keys::REGION_META_MAX_KEY;
+        let start_key = keys::REGION_RAFT_MIN_KEY;
+        let end_key = keys::REGION_RAFT_MAX_KEY;
 
         let iter_opt =
             rocksdb_util::IterOption::new(Some(start_key.to_vec()), Some(end_key.to_vec()), false);
@@ -85,22 +88,17 @@ impl Runner {
         let apply_states = &mut self.apply_states;
         rocksdb_util::scan_db_iterator(iter, start_key, |key, value| {
             let (region_id, suffix) = keys::decode_apply_state_key(key)?;
-            match suffix {
-                keys::APPLY_STATE_SUFFIX => {
-                    let state = ApplyState::parse(value);
-                    info!("[region {}] restore apply state {:?}", region_id, state);
-                    apply_states.insert(region_id, state);
-                }
-                keys::SNAPSHOT_RAFT_STATE_SUFFIX => {
-                    // TODO: restore snapshot states.
-                }
-                _ => {
-                    warn!("unknown key: {:?}", escape(key));
-                }
+            if suffix == keys::APPLY_STATE_SUFFIX {
+                let state = ApplyState::parse(value);
+                info!("[region {}] restore apply state {:?}", region_id, state);
+                apply_states.insert(region_id, state);
+            } else {
+                warn!("unknown key: {:?}", escape(key));
             }
             Ok(true)
         })
         .unwrap();
+        info!("restore apply states, total: {}", apply_states.len());
     }
 
     fn persist_apply(&mut self) {
@@ -146,6 +144,14 @@ impl Runner {
         let mut resps_batch = CommandResponseBatch::new();
         resps_batch.set_responses(resps.into());
         self.notifier.unbounded_send(resps_batch).unwrap();
+    }
+
+    fn persist_and_report_apply(&mut self) {
+        if self.pending_write_and_report {
+            self.persist_apply();
+            self.report_apply_states();
+            self.pending_write_and_report = false;
+        }
     }
 
     fn apply_cmds(&mut self, mut cmds: CommandRequestBatch) {
@@ -255,6 +261,7 @@ impl Runner {
 impl Runnable<Task> for Runner {
     fn run_batch(&mut self, batch: &mut Vec<Task>) {
         for task in batch.drain(..) {
+            self.pending_write_and_report = true;
             match task {
                 Task::Commands { commands } => {
                     self.apply_cmds(commands);
@@ -273,17 +280,15 @@ impl Runnable<Task> for Runner {
         }
     }
 
-    fn on_tick(&mut self) {}
-
     fn shutdown(&mut self) {
-        self.on_tick();
+        self.pending_write_and_report = true;
+        self.persist_and_report_apply();
     }
 }
 
 impl RunnableWithTimer<Task, ()> for Runner {
     fn on_timeout(&mut self, timer: &mut Timer<()>, _: ()) {
-        self.persist_apply();
-        self.report_apply_states();
+        self.persist_and_report_apply();
 
         // report every 5 scends.
         timer.add_task(Duration::from_secs(5), ());

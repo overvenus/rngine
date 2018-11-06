@@ -96,9 +96,10 @@ fn adjust_dynamic_level_bytes(cf_descs: &[CColumnFamilyDescriptor], cf_options: 
     {
         let existed_dynamic_level_bytes =
             cf_desc.options().get_level_compaction_dynamic_level_bytes();
-        if existed_dynamic_level_bytes != cf_options
-            .options
-            .get_level_compaction_dynamic_level_bytes()
+        if existed_dynamic_level_bytes
+            != cf_options
+                .options
+                .get_level_compaction_dynamic_level_bytes()
         {
             println!(
                 "change dynamic_level_bytes for existing column family is danger, old: {}, new: {}",
@@ -256,6 +257,9 @@ where
     F: FnMut(&[u8], &[u8]) -> Result<bool, String>,
 {
     it.seek(start_key.into());
+    if !it.valid() {
+        error!("iter an invalid start key");
+    }
     while it.valid() {
         let r = f(it.key(), it.value())?;
 
