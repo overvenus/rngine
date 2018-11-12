@@ -6,17 +6,25 @@ extern crate env_logger;
 extern crate nix;
 extern crate rngine;
 extern crate signal;
+#[macro_use(slog_o)]
+extern crate slog;
 
 use std::fs::{self, File};
+use std::io::BufWriter;
 use std::path::Path;
 use std::sync::Arc;
 use std::{panic, process, thread};
 
 use clap::{App, Arg, ArgMatches};
 use fs2::FileExt;
+use slog::{Drain, Logger};
+use slog_async::{Async, OverflowStrategy};
+use slog_scope::GlobalLoggerGuard;
+use slog_term::{PlainDecorator, TermDecorator};
 
 use rngine::config::RgConfig;
 use rngine::engine::Engine;
+use rngine::logger;
 use rngine::rocksdb_util;
 use rngine::server::{Server, Service};
 
@@ -50,6 +58,15 @@ fn main() {
                 .help("Sets the path to store directory"),
         )
         .arg(
+            Arg::with_name("log-file")
+                .short("f")
+                .long("log-file")
+                .takes_value(true)
+                .value_name("FILE")
+                .help("Sets log file")
+                .long_help("Sets log file. If not set, output log to stderr"),
+        )
+        .arg(
             Arg::with_name("print-sample-config")
                 .long("print-sample-config")
                 .help("Print a sample config to stdout"),
@@ -67,8 +84,7 @@ fn main() {
     overwrite_config_with_cmd_args(&mut config, &matches);
 
     // Install logger.
-    let env = env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info");
-    env_logger::Builder::from_env(env).init();
+    let _guard = init_log(&config);
 
     info!("Welcome to Rng");
 
@@ -138,6 +154,10 @@ fn overwrite_config_with_cmd_args(config: &mut RgConfig, matches: &ArgMatches) {
     if let Some(data_dir) = matches.value_of("data-dir") {
         config.path = data_dir.to_owned();
     }
+
+    if let Some(log_file) = matches.value_of("log-file") {
+        config.log_file = log_file.to_owned();
+    }
 }
 
 // Exit the whole process when panic.
@@ -190,4 +210,56 @@ fn set_panic_hook(panic_abort: bool) {
             process::exit(1);
         }
     }))
+}
+
+pub fn init_log(config: &RgConfig) -> GlobalLoggerGuard {
+    // Default is 128.
+    // Extended since blocking is set, and we don't want to block very often.
+    const SLOG_CHANNEL_SIZE: usize = 10240;
+    // Default is DropAndReport.
+    // It is not desirable to have dropped logs in our use case.
+    const SLOG_CHANNEL_OVERFLOW_STRATEGY: OverflowStrategy = OverflowStrategy::Block;
+
+    let log_rotation_timespan =
+        chrono::Duration::from_std(config.log_rotation_timespan.clone().into())
+            .expect("config.log_rotation_timespan is an invalid duration.");
+
+    // TODO: add it config.
+    let log_level = slog::Level::Debug;
+
+    let guard = if config.log_file.is_empty() {
+        let decorator = TermDecorator::new().build();
+        let drain = logger::TikvFormat::new(decorator).fuse();
+        let drain = Async::new(drain)
+            .chan_size(SLOG_CHANNEL_SIZE)
+            .overflow_strategy(SLOG_CHANNEL_OVERFLOW_STRATEGY)
+            .thread_name("term-slogger".to_owned())
+            .build()
+            .fuse();
+        let logger = Logger::root_typed(drain, slog_o!());
+        logger::init_log(logger, log_level).unwrap_or_else(|e| {
+            panic!("failed to initialize log: {:?}", e);
+        })
+    } else {
+        let logger = BufWriter::new(
+            logger::RotatingFileLogger::new(&config.log_file, log_rotation_timespan)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "failed to initialize log with file {:?}: {:?}",
+                        config.log_file, e
+                    );
+                }),
+        );
+        let decorator = PlainDecorator::new(logger);
+        let drain = logger::TikvFormat::new(decorator).fuse();
+        let drain = Async::new(drain)
+            .thread_name("file-slogger".to_owned())
+            .build()
+            .fuse();
+        let logger = Logger::root_typed(drain, slog_o!());
+        logger::init_log(logger, log_level).unwrap_or_else(|e| {
+            panic!("failed to initialize log: {:?}", e);
+        })
+    };
+    guard
 }

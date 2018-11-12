@@ -23,6 +23,9 @@ pub struct RgConfig {
     pub path: String,
     pub address: String,
     pub rocksdb: DbConfig,
+
+    pub log_file: String,
+    pub log_rotation_timespan: ReadableDuration,
 }
 
 impl RgConfig {
@@ -53,6 +56,8 @@ impl Default for RgConfig {
             path: "./data".to_owned(),
             address: "127.0.0.1:3930".to_owned(),
             rocksdb: DbConfig::default(),
+            log_file: "./rngine.log".to_owned(),
+            log_rotation_timespan: ReadableDuration::hours(24),
         }
     }
 }
