@@ -177,26 +177,49 @@ impl RegionMeta {
     }
 }
 
-#[test]
-fn test_region_meta_serde() {
-    let applied_term = 20181108;
+// When we create a region peer, we should initialize its log term/index > 0,
+// so that we can force the follower peer to sync the snapshot first.
+pub const RAFT_INIT_LOG_TERM: u64 = 5;
+pub const RAFT_INIT_LOG_INDEX: u64 = 5;
 
-    let mut peer = metapb::Peer::new();
-    peer.set_id(11);
-    peer.set_store_id(2018);
-
-    let mut region = metapb::Region::new();
-    region.set_id(17);
-    region.set_start_key(b"v: ::std::vec::Vec<u7>".to_vec());
-    region.set_end_key(b"v: ::std::vec::Vec<u9>".to_vec());
-    region.set_peers(vec![peer.clone()].into());
-
+// When we bootstrap the region or handling split new region, we must
+// call this to initialize region apply state first.
+pub fn initial_apply_state() -> RaftApplyState {
     let mut apply_state = RaftApplyState::new();
-    apply_state.set_applied_index(applied_term * 2);
-    apply_state.mut_truncated_state().set_index(1);
+    apply_state.set_applied_index(RAFT_INIT_LOG_INDEX);
+    apply_state
+        .mut_truncated_state()
+        .set_index(RAFT_INIT_LOG_INDEX);
+    apply_state
+        .mut_truncated_state()
+        .set_term(RAFT_INIT_LOG_TERM);
 
-    let meta = RegionMeta::new(peer, region, apply_state);
-    let mut buf = Vec::new();
-    meta.write_to(&mut buf).unwrap();
-    assert_eq!(RegionMeta::parse(&buf), meta);
+    apply_state
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_region_meta_serde() {
+        let applied_term = 20181108;
+
+        let mut peer = metapb::Peer::new();
+        peer.set_id(11);
+        peer.set_store_id(2018);
+
+        let mut region = metapb::Region::new();
+        region.set_id(17);
+        region.set_start_key(b"v: ::std::vec::Vec<u7>".to_vec());
+        region.set_end_key(b"v: ::std::vec::Vec<u9>".to_vec());
+        region.set_peers(vec![peer.clone()].into());
+
+        let mut apply_state = RaftApplyState::new();
+        apply_state.set_applied_index(applied_term * 2);
+        apply_state.mut_truncated_state().set_index(1);
+
+        let meta = RegionMeta::new(peer, region, apply_state);
+        let mut buf = Vec::new();
+        meta.write_to(&mut buf).unwrap();
+        assert_eq!(RegionMeta::parse(&buf), meta);
+    }
 }

@@ -8,14 +8,14 @@ use kvproto::enginepb::{
     CommandRequest, CommandRequestBatch, CommandResponse, CommandResponseBatch,
 };
 use kvproto::metapb;
-use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, CmdType, Request};
+use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, AdminResponse, CmdType, Request};
 use raft::eraftpb;
 use rocksdb::{DBIterator, Writable, WriteBatch, WriteOptions, DB};
 
 use super::super::keys::{self, escape};
 use super::super::rocksdb_util::{self, CF_DEFAULT};
 use super::super::worker::{Runnable, RunnableWithTimer, Timer};
-use super::RegionMeta;
+use super::{initial_apply_state, RegionMeta};
 
 pub enum Task {
     Commands { commands: CommandRequestBatch },
@@ -122,24 +122,32 @@ impl Delegate {
         self.meta.to_command_response()
     }
 
-    fn apply_cmd(&mut self, mut cmd: CommandRequest, db: &DB) -> bool {
+    fn apply_cmd(&mut self, mut cmd: CommandRequest, db: &DB) -> (bool, Option<Vec<RegionMeta>>) {
         assert!(!self.pending_remove);
-        let mut need_sync = false;
         let header = cmd.take_header();
         let term = header.get_term();
         let index = header.get_index();
+
+        let mut metas = None;
         if cmd.has_admin_request() {
             let request = cmd.take_admin_request();
+            let response = cmd.take_admin_response();
             let cmd_type = request.get_cmd_type();
             info!(
                 "{} execute admin command {:?} at [term: {}, index: {}]",
                 self.tag, request, term, index
             );
 
+            // Caller must mark it as a sync log request.
+            assert!(header.get_sync_log());
             match cmd_type {
-                AdminCmdType::ChangePeer => self.exec_change_peer(&request),
-                // AdminCmdType::Split => delegate.exec_split(request),
-                other => error!("unsupported admin command type {:?}", other),
+                AdminCmdType::ChangePeer => self.exec_change_peer(&request, response),
+                AdminCmdType::BatchSplit => metas = self.exec_batch_split(&request, response),
+                // To support compact log, we need to persist all changes to disk.
+                AdminCmdType::CompactLog => (),
+                other => {
+                    error!("unsupported admin command type {:?}", other);
+                }
             }
         } else {
             for req in cmd.take_requests().into_vec() {
@@ -147,13 +155,7 @@ impl Delegate {
                 match cmd_type {
                     CmdType::Put => self.handle_put(&req, db),
                     CmdType::Delete => self.handle_delete(&req, db),
-                    // CmdType::DeleteRange => {
-                    //     self.handle_delete_range(req, &mut ranges, ctx.use_delete_range)
-                    // }
-                    // Readonly commands are handled in raftstore directly.
-                    // Don't panic here in case there are old entries need to be applied.
-                    // It's also safe to skip them here, because a restart must have happened,
-                    // hence there is no callback to be called.
+                    // Following commands are not supported.
                     CmdType::DeleteRange | CmdType::IngestSST | CmdType::Snap | CmdType::Get => {
                         warn!("{} skip unsupported command: {:?}", self.tag, req);
                         continue;
@@ -162,9 +164,6 @@ impl Delegate {
                         panic!("invalid cmd type, message maybe currupted")
                     }
                 }
-            }
-            if header.get_sync_log() {
-                need_sync = true;
             }
         }
 
@@ -176,7 +175,7 @@ impl Delegate {
         self.meta.apply_state.set_applied_index(index);
         self.meta.applied_term = term;
 
-        need_sync
+        (header.get_sync_log(), metas)
     }
 
     fn handle_put(&mut self, req: &Request, db: &DB) {
@@ -229,107 +228,63 @@ impl Delegate {
         }
     }
 
-    fn exec_change_peer(&mut self, request: &AdminRequest) {
+    fn exec_change_peer(&mut self, request: &AdminRequest, mut response: AdminResponse) {
         let request = request.get_change_peer();
-        let peer = request.get_peer();
-        let store_id = peer.get_store_id();
-        let change_type = request.get_change_type();
-        let mut region = self.meta.region.clone();
+        let new_region = response.take_change_peer().take_region();
 
         info!(
-            "{} exec ConfChange {:?}, epoch: {:?}",
+            "{} exec {:?}, region {:?} -> {:?}",
             self.tag,
-            change_type,
-            region.get_region_epoch()
+            request,
+            self.meta.region.get_peers(),
+            new_region.get_peers()
         );
 
-        match change_type {
-            eraftpb::ConfChangeType::AddNode => {
-                let mut exists = false;
-                if let Some(p) = find_peer_mut(&mut region, store_id) {
-                    exists = true;
-                    if !p.get_is_learner() || p.get_id() != peer.get_id() {
-                        error!(
-                            "{} can't add duplicated peer {:?} to region {:?}",
-                            self.tag, peer, self.meta.region
-                        );
-                        return;
-                    } else {
-                        p.set_is_learner(false);
-                    }
-                }
-                if !exists {
-                    // TODO: Do we allow adding peer in same node?
-                    region.mut_peers().push(peer.clone());
-                }
-
-                info!(
-                    "{} add peer {:?} to region {:?}",
-                    self.tag, peer, self.meta.region
-                );
+        match request.get_change_type() {
+            eraftpb::ConfChangeType::AddNode | eraftpb::ConfChangeType::AddLearnerNode => {
+                self.meta.region = new_region;
             }
             eraftpb::ConfChangeType::RemoveNode => {
-                if let Some(p) = remove_peer(&mut region, store_id) {
-                    // Considering `is_learner` flag in `Peer` here is by design.
-                    if &p != peer {
-                        error!(
-                            "{} remove unmatched peer: expect: {:?}, get {:?}, ignore",
-                            self.tag, peer, p
-                        );
-                        return;
-                    }
-                    if self.meta.peer.get_id() == peer.get_id() {
-                        // Remove ourself, we will destroy all region data later.
-                        // So we need not to apply following logs.
-                        self.pending_remove = true;
-                    }
-                } else {
-                    error!(
-                        "{} remove missing peer {:?} from region {:?}",
-                        self.tag, peer, self.meta.region
-                    );
-                    return;
+                let peer = request.get_peer();
+                if self.meta.peer.get_id() == peer.get_id() {
+                    // Remove ourself, we will destroy all region data later.
+                    // So we need not to apply following logs.
+                    self.pending_remove = true;
+                    info!("{} removes self", self.tag);
                 }
-
-                info!(
-                    "{} remove {} from region:{:?}",
-                    self.tag,
-                    peer.get_id(),
-                    self.meta.region
-                );
-            }
-            eraftpb::ConfChangeType::AddLearnerNode => {
-                if find_peer(&region, store_id).is_some() {
-                    error!(
-                        "{} can't add duplicated learner {:?} to region {:?}",
-                        self.tag, peer, self.meta.region
-                    );
-                    return;
-                }
-                region.mut_peers().push(peer.clone());
-
-                info!(
-                    "{} add learner {:?} to region {:?}",
-                    self.tag, peer, self.meta.region
-                );
             }
         }
     }
-}
 
-fn remove_peer(region: &mut metapb::Region, store_id: u64) -> Option<metapb::Peer> {
-    region
-        .get_peers()
-        .iter()
-        .position(|x| x.get_store_id() == store_id)
-        .map(|i| region.mut_peers().remove(i))
-}
+    fn exec_batch_split(
+        &mut self,
+        req: &AdminRequest,
+        mut response: AdminResponse,
+    ) -> Option<Vec<RegionMeta>> {
+        let split_reqs = req.get_splits();
+        let new_regions = response.take_splits().take_regions().into_vec();
+        if split_reqs.get_requests().is_empty() {
+            error!("missing split requests");
+            return None;
+        }
+        info!(
+            "{} exec {:?}, region {:?} -> regions {:?}",
+            self.tag, split_reqs, self.meta.region, new_regions,
+        );
 
-fn find_peer_mut(region: &mut metapb::Region, store_id: u64) -> Option<&mut metapb::Peer> {
-    region
-        .mut_peers()
-        .iter_mut()
-        .find(|p| p.get_store_id() == store_id)
+        let mut metas = Vec::with_capacity(split_reqs.get_requests().len() - 1);
+        let store_id = self.meta.peer.get_store_id();
+        for r in new_regions {
+            if r.get_id() == self.meta.region.get_id() {
+                self.meta.region = r;
+            } else {
+                let peer = find_peer(&r, store_id).unwrap();
+                let apply_state = initial_apply_state();
+                metas.push(RegionMeta::new(peer.to_owned(), r, apply_state));
+            }
+        }
+        Some(metas)
+    }
 }
 
 fn find_peer(region: &metapb::Region, store_id: u64) -> Option<&metapb::Peer> {
@@ -427,10 +382,23 @@ impl Runner {
                 debug!("{} is pending remove, drop cmd {:?}", delegate.tag, cmd);
                 continue;
             }
-            if delegate.apply_cmd(cmd, &self.db) {
+            let (sync_log, metas) = delegate.apply_cmd(cmd, &self.db);
+            if sync_log {
                 self.pending_sync_delegates.insert(region_id);
             }
+            if let Some(metas) = metas {
+                for m in metas {
+                    self.insert_delegates(m);
+                }
+            }
         }
+    }
+
+    fn insert_delegates(&mut self, meta: RegionMeta) {
+        let region_id = meta.region.get_id();
+        self.delegates
+            .insert(region_id, Delegate::from_region_meta(meta));
+        self.pending_sync_delegates.insert(region_id);
     }
 }
 
@@ -442,9 +410,7 @@ impl Runnable<Task> for Runner {
                     self.apply_cmds(commands);
                 }
                 Task::RegionMeta { meta } => {
-                    let region_id = meta.region.get_id();
-                    self.delegates
-                        .insert(region_id, Delegate::from_region_meta(meta));
+                    self.insert_delegates(meta);
                 }
             }
         }
