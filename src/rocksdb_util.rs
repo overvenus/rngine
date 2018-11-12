@@ -19,7 +19,7 @@ use rocksdb::rocksdb::supported_compression;
 use rocksdb::CFHandle;
 use rocksdb::{
     CColumnFamilyDescriptor, ColumnFamilyOptions, CompactOptions, DBCompressionType, DBIterator,
-    DBOptions, Env, ReadOptions, DB,
+    DBOptions, Env, ReadOptions, Writable, WriteBatch, DB,
 };
 
 pub type CfName = &'static str;
@@ -329,4 +329,11 @@ pub fn compact_range(
     compact_opts.set_exclusive_manual_compaction(exclusive_manual);
     compact_opts.set_max_subcompactions(max_subcompactions as i32);
     db.compact_range_cf_opt(handle, &compact_opts, start_key, end_key);
+}
+
+pub fn delete_all_in_range(db: &DB, start_key: &[u8], end_key: &[u8], wb: &WriteBatch) {
+    for cf in ALL_CFS {
+        let handle = get_cf_handle(db, cf).unwrap();
+        wb.delete_range_cf(handle, start_key, end_key).unwrap();
+    }
 }

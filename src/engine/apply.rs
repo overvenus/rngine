@@ -1,24 +1,25 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::sync::mpsc::UnboundedSender;
 use kvproto::enginepb::{
-    CommandRequestBatch, CommandResponse, CommandResponseBatch, CommandResponseHeader,
-    SnapshotState,
+    CommandRequest, CommandRequestBatch, CommandResponse, CommandResponseBatch,
 };
-use kvproto::raft_cmdpb::{CmdType, Request};
+use kvproto::metapb;
+use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, CmdType, Request};
+use raft::eraftpb;
 use rocksdb::{DBIterator, Writable, WriteBatch, WriteOptions, DB};
 
 use super::super::keys::{self, escape};
 use super::super::rocksdb_util::{self, CF_DEFAULT};
 use super::super::worker::{Runnable, RunnableWithTimer, Timer};
-use super::ApplyState;
+use super::RegionMeta;
 
 pub enum Task {
     Commands { commands: CommandRequestBatch },
-    Snapshot { state: SnapshotState },
+    RegionMeta { meta: RegionMeta },
 }
 
 impl Task {
@@ -26,8 +27,8 @@ impl Task {
         Task::Commands { commands }
     }
 
-    pub fn snapshot(state: SnapshotState) -> Task {
-        Task::Snapshot { state }
+    pub fn region_meta(meta: RegionMeta) -> Task {
+        Task::RegionMeta { meta }
     }
 }
 
@@ -39,42 +40,339 @@ impl fmt::Display for Task {
 
 const DEFAULT_APPLY_WB_SIZE: usize = 4 * 1024;
 
+struct Delegate {
+    meta: RegionMeta,
+    wb: WriteBatch,
+    pending_remove: bool,
+
+    tag: String,
+}
+
+impl Delegate {
+    fn from_region_meta(meta: RegionMeta) -> Delegate {
+        let tag = format!("[region {}]", meta.region.get_id());
+        info!("{} create delegate with {:?}", tag, meta);
+        Delegate {
+            meta,
+            wb: WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE),
+            pending_remove: false,
+            tag,
+        }
+    }
+
+    fn persist(&mut self, db: &DB) -> CommandResponse {
+        info!(
+            "{} persist apply delegate {:?}",
+            self.tag, self.meta.apply_state
+        );
+
+        let apply_state_key = keys::apply_state_key(self.meta.region.get_id());
+        let mut buffer = Vec::new();
+        self.meta.write_to(&mut buffer).unwrap();
+        self.wb.put(&apply_state_key, &buffer).unwrap_or_else(|e| {
+            panic!(
+                "{} failed to persist apply state {}: {:?}",
+                self.tag,
+                escape(&apply_state_key),
+                e
+            )
+        });
+
+        let mut write_opts = WriteOptions::new();
+        write_opts.set_sync(true);
+        let mut wb = WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE);
+        ::std::mem::swap(&mut self.wb, &mut wb);
+        db.write_opt(wb, &write_opts).unwrap_or_else(|e| {
+            panic!("failed to write to engine: {:?}", e);
+        });
+
+        self.meta.to_command_response()
+    }
+
+    fn destroy(&mut self, db: &DB) -> CommandResponse {
+        assert!(self.pending_remove);
+        info!(
+            "{} destroy apply delegate {:?}",
+            self.tag, self.meta.apply_state
+        );
+
+        let start_key = keys::enc_start_key(&self.meta.region);
+        let end_key = keys::enc_end_key(&self.meta.region);
+        assert!(start_key <= end_key);
+
+        rocksdb_util::delete_all_in_range(db, &start_key, &end_key, &self.wb);
+        let apply_state_key = keys::apply_state_key(self.meta.region.get_id());
+        self.wb.delete(&apply_state_key).unwrap_or_else(|e| {
+            panic!(
+                "{} failed to delete {}: {:?}",
+                self.tag,
+                escape(&apply_state_key),
+                e
+            )
+        });
+
+        let mut write_opts = WriteOptions::new();
+        write_opts.set_sync(true);
+        let mut wb = WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE);
+        ::std::mem::swap(&mut self.wb, &mut wb);
+        db.write_opt(wb, &write_opts).unwrap_or_else(|e| {
+            panic!("failed to write to engine: {:?}", e);
+        });
+
+        self.meta.to_command_response()
+    }
+
+    fn apply_cmd(&mut self, mut cmd: CommandRequest, db: &DB) -> bool {
+        assert!(!self.pending_remove);
+        let mut need_sync = false;
+        let header = cmd.take_header();
+        let term = header.get_term();
+        let index = header.get_index();
+        if cmd.has_admin_request() {
+            let request = cmd.take_admin_request();
+            let cmd_type = request.get_cmd_type();
+            info!(
+                "{} execute admin command {:?} at [term: {}, index: {}]",
+                self.tag, request, term, index
+            );
+
+            match cmd_type {
+                AdminCmdType::ChangePeer => self.exec_change_peer(&request),
+                // AdminCmdType::Split => delegate.exec_split(request),
+                other => error!("unsupported admin command type {:?}", other),
+            }
+        } else {
+            for req in cmd.take_requests().into_vec() {
+                let cmd_type = req.get_cmd_type();
+                match cmd_type {
+                    CmdType::Put => self.handle_put(&req, db),
+                    CmdType::Delete => self.handle_delete(&req, db),
+                    // CmdType::DeleteRange => {
+                    //     self.handle_delete_range(req, &mut ranges, ctx.use_delete_range)
+                    // }
+                    // Readonly commands are handled in raftstore directly.
+                    // Don't panic here in case there are old entries need to be applied.
+                    // It's also safe to skip them here, because a restart must have happened,
+                    // hence there is no callback to be called.
+                    CmdType::DeleteRange | CmdType::IngestSST | CmdType::Snap | CmdType::Get => {
+                        warn!("{} skip unsupported command: {:?}", self.tag, req);
+                        continue;
+                    }
+                    CmdType::Prewrite | CmdType::Invalid => {
+                        panic!("invalid cmd type, message maybe currupted")
+                    }
+                }
+            }
+            if header.get_sync_log() {
+                need_sync = true;
+            }
+        }
+
+        // Advance applied index and term.
+        debug!(
+            "{} advance applied index {} and term {}",
+            self.tag, index, term
+        );
+        self.meta.apply_state.set_applied_index(index);
+        self.meta.applied_term = term;
+
+        need_sync
+    }
+
+    fn handle_put(&mut self, req: &Request, db: &DB) {
+        let (key, value) = (req.get_put().get_key(), req.get_put().get_value());
+
+        let key = keys::data_key(key);
+        if !req.get_put().get_cf().is_empty() {
+            let cf = req.get_put().get_cf();
+            rocksdb_util::get_cf_handle(db, cf)
+                .and_then(|handle| self.wb.put_cf(handle, &key, value))
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{} failed to write ({}, {}) to cf {}: {:?}",
+                        self.tag,
+                        escape(&key),
+                        escape(value),
+                        cf,
+                        e
+                    )
+                });
+        } else {
+            self.wb.put(&key, value).unwrap_or_else(|e| {
+                panic!(
+                    "{} failed to write ({}, {}): {:?}",
+                    self.tag,
+                    escape(&key),
+                    escape(value),
+                    e
+                );
+            });
+        }
+    }
+
+    fn handle_delete(&mut self, req: &Request, db: &DB) {
+        let key = req.get_delete().get_key();
+
+        let key = keys::data_key(key);
+        if !req.get_delete().get_cf().is_empty() {
+            let cf = req.get_delete().get_cf();
+            // TODO: check whether cf exists or not.
+            rocksdb_util::get_cf_handle(db, cf)
+                .and_then(|handle| self.wb.delete_cf(handle, &key))
+                .unwrap_or_else(|e| {
+                    panic!("{} failed to delete {}: {:?}", self.tag, escape(&key), e)
+                });
+        } else {
+            self.wb.delete(&key).unwrap_or_else(|e| {
+                panic!("{} failed to delete {}: {:?}", self.tag, escape(&key), e)
+            });
+        }
+    }
+
+    fn exec_change_peer(&mut self, request: &AdminRequest) {
+        let request = request.get_change_peer();
+        let peer = request.get_peer();
+        let store_id = peer.get_store_id();
+        let change_type = request.get_change_type();
+        let mut region = self.meta.region.clone();
+
+        info!(
+            "{} exec ConfChange {:?}, epoch: {:?}",
+            self.tag,
+            change_type,
+            region.get_region_epoch()
+        );
+
+        match change_type {
+            eraftpb::ConfChangeType::AddNode => {
+                let mut exists = false;
+                if let Some(p) = find_peer_mut(&mut region, store_id) {
+                    exists = true;
+                    if !p.get_is_learner() || p.get_id() != peer.get_id() {
+                        error!(
+                            "{} can't add duplicated peer {:?} to region {:?}",
+                            self.tag, peer, self.meta.region
+                        );
+                        return;
+                    } else {
+                        p.set_is_learner(false);
+                    }
+                }
+                if !exists {
+                    // TODO: Do we allow adding peer in same node?
+                    region.mut_peers().push(peer.clone());
+                }
+
+                info!(
+                    "{} add peer {:?} to region {:?}",
+                    self.tag, peer, self.meta.region
+                );
+            }
+            eraftpb::ConfChangeType::RemoveNode => {
+                if let Some(p) = remove_peer(&mut region, store_id) {
+                    // Considering `is_learner` flag in `Peer` here is by design.
+                    if &p != peer {
+                        error!(
+                            "{} remove unmatched peer: expect: {:?}, get {:?}, ignore",
+                            self.tag, peer, p
+                        );
+                        return;
+                    }
+                    if self.meta.peer.get_id() == peer.get_id() {
+                        // Remove ourself, we will destroy all region data later.
+                        // So we need not to apply following logs.
+                        self.pending_remove = true;
+                    }
+                } else {
+                    error!(
+                        "{} remove missing peer {:?} from region {:?}",
+                        self.tag, peer, self.meta.region
+                    );
+                    return;
+                }
+
+                info!(
+                    "{} remove {} from region:{:?}",
+                    self.tag,
+                    peer.get_id(),
+                    self.meta.region
+                );
+            }
+            eraftpb::ConfChangeType::AddLearnerNode => {
+                if find_peer(&region, store_id).is_some() {
+                    error!(
+                        "{} can't add duplicated learner {:?} to region {:?}",
+                        self.tag, peer, self.meta.region
+                    );
+                    return;
+                }
+                region.mut_peers().push(peer.clone());
+
+                info!(
+                    "{} add learner {:?} to region {:?}",
+                    self.tag, peer, self.meta.region
+                );
+            }
+        }
+    }
+}
+
+fn remove_peer(region: &mut metapb::Region, store_id: u64) -> Option<metapb::Peer> {
+    region
+        .get_peers()
+        .iter()
+        .position(|x| x.get_store_id() == store_id)
+        .map(|i| region.mut_peers().remove(i))
+}
+
+fn find_peer_mut(region: &mut metapb::Region, store_id: u64) -> Option<&mut metapb::Peer> {
+    region
+        .mut_peers()
+        .iter_mut()
+        .find(|p| p.get_store_id() == store_id)
+}
+
+fn find_peer(region: &metapb::Region, store_id: u64) -> Option<&metapb::Peer> {
+    region
+        .get_peers()
+        .iter()
+        .find(|&p| p.get_store_id() == store_id)
+}
+
+const PERSIST_INTERVAL: u64 = 30; // 30 seconds.
+
 pub struct Runner {
     db: Arc<DB>,
     notifier: UnboundedSender<CommandResponseBatch>,
 
     // region id -> apply state
-    apply_states: HashMap<u64, ApplyState>,
-
-    wb: WriteBatch,
-    pending_write_and_report: bool,
+    delegates: HashMap<u64, Delegate>,
+    pending_sync_delegates: HashSet<u64>,
 }
 
 impl Runner {
     pub fn new(db: Arc<DB>, notifier: UnboundedSender<CommandResponseBatch>) -> Runner {
-        let mut worker = Runner {
+        let mut runner = Runner {
             db,
             notifier,
-            apply_states: HashMap::new(),
-            wb: WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE),
-            pending_write_and_report: false,
+            delegates: HashMap::new(),
+            pending_sync_delegates: HashSet::new(),
         };
 
-        worker.restore_apply_states();
+        let resps = runner.restore_apply_states();
         // Report apply states as soon as possible.
-        worker.report_apply_states();
-        worker
+        runner.report_applied(resps);
+        runner
     }
 
     pub fn timer(&self) -> Timer<()> {
         let mut timer = Timer::new(1);
 
-        // report every 5 scends.
-        timer.add_task(Duration::from_secs(5), ());
+        timer.add_task(Duration::from_secs(PERSIST_INTERVAL), ());
         timer
     }
 
-    fn restore_apply_states(&mut self) {
+    fn restore_apply_states(&mut self) -> Vec<CommandResponse> {
         // Scan region meta to get saved regions.
         let start_key = keys::REGION_RAFT_MIN_KEY;
         let end_key = keys::REGION_RAFT_MAX_KEY;
@@ -85,175 +383,53 @@ impl Runner {
         let readopts = iter_opt.build_read_opts();
         let iter = DBIterator::new_cf(self.db.as_ref(), handle, readopts);
 
-        let apply_states = &mut self.apply_states;
+        let mut resps = Vec::new();
+        let delegates = &mut self.delegates;
         rocksdb_util::scan_db_iterator(iter, start_key, |key, value| {
             let (region_id, suffix) = keys::decode_apply_state_key(key)?;
             if suffix == keys::APPLY_STATE_SUFFIX {
-                let state = ApplyState::parse(value);
-                info!("[region {}] restore apply state {:?}", region_id, state);
-                apply_states.insert(region_id, state);
+                let meta = RegionMeta::parse(value);
+                info!("[region {}] restore apply delegate {:?}", region_id, meta);
+                resps.push(meta.to_command_response());
+                let d = Delegate::from_region_meta(meta);
+                delegates.insert(region_id, d);
             } else {
                 warn!("unknown key: {:?}", escape(key));
             }
             Ok(true)
         })
         .unwrap();
-        info!("restore apply states, total: {}", apply_states.len());
+        info!("restore apply delegates, total: {}", delegates.len());
+        resps
     }
 
-    fn persist_apply(&mut self) {
-        info!("persist apply state, total: {}", self.apply_states.len());
-        let mut buffer = Vec::new();
-        for (region_id, applied_state) in &self.apply_states {
-            applied_state.write_to(&mut buffer).unwrap();
-            let apply_state_key = keys::apply_state_key(*region_id);
-            self.wb.put(&apply_state_key, &buffer).unwrap_or_else(|e| {
-                panic!(
-                    "[region {}] failed to apply state {}: {:?}",
-                    region_id,
-                    escape(&apply_state_key),
-                    e
-                )
-            });
-
-            // To write next region's apply state, we need to clear the buffer.
-            buffer.clear();
-        }
-        let mut write_opts = WriteOptions::new();
-        write_opts.set_sync(true /* TODO: consider header.sync_log */);
-        let mut wb = WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE);
-        ::std::mem::swap(&mut self.wb, &mut wb);
-        self.db.write_opt(wb, &write_opts).unwrap_or_else(|e| {
-            panic!("failed to write to engine: {:?}", e);
-        });
-    }
-
-    fn report_apply_states(&self) {
-        info!("report apply state, total: {}", self.apply_states.len());
-        let mut resps = Vec::with_capacity(self.apply_states.len());
-        for (region_id, state) in &self.apply_states {
-            debug!("[region {}] reports apply state {:?}", region_id, state);
-            let mut header = CommandResponseHeader::new();
-            header.set_region_id(*region_id);
-            let mut resp = CommandResponse::new();
-            resp.set_header(header);
-            resp.set_apply_state(state.state.clone());
-            resp.set_applied_term(state.applied_term);
-            resps.push(resp);
-        }
+    fn report_applied(&self, resps: Vec<CommandResponse>) {
+        info!("report apply delegates, total: {}", resps.len());
         let mut resps_batch = CommandResponseBatch::new();
         resps_batch.set_responses(resps.into());
-        self.notifier.unbounded_send(resps_batch).unwrap();
-    }
-
-    fn persist_and_report_apply(&mut self) {
-        if self.pending_write_and_report {
-            self.persist_apply();
-            self.report_apply_states();
-            self.pending_write_and_report = false;
+        if let Err(e) = self.notifier.unbounded_send(resps_batch) {
+            error!("response notifier is closed {:?}", e);
         }
     }
 
     fn apply_cmds(&mut self, mut cmds: CommandRequestBatch) {
-        for mut cmd in cmds.take_requests().into_vec() {
+        for cmd in cmds.take_requests().into_vec() {
             assert!(cmd.has_header());
-            let header = cmd.take_header();
-            let region_id = header.get_region_id();
-            for req in cmd.take_requests().into_vec() {
-                let cmd_type = req.get_cmd_type();
-                match cmd_type {
-                    CmdType::Put => self.handle_put(region_id, &req),
-                    CmdType::Delete => self.handle_delete(region_id, &req),
-                    // CmdType::DeleteRange => {
-                    //     self.handle_delete_range(req, &mut ranges, ctx.use_delete_range)
-                    // }
-                    // Readonly commands are handled in raftstore directly.
-                    // Don't panic here in case there are old entries need to be applied.
-                    // It's also safe to skip them here, because a restart must have happened,
-                    // hence there is no callback to be called.
-                    CmdType::DeleteRange | CmdType::IngestSST | CmdType::Snap | CmdType::Get => {
-                        warn!("[region {}] skip unsupported command: {:?}", region_id, req);
-                        continue;
-                    }
-                    CmdType::Prewrite | CmdType::Invalid => {
-                        panic!("invalid cmd type, message maybe currupted")
-                    }
-                }
+            let region_id = cmd.get_header().get_region_id();
+            let delegate;
+            if let Some(d) = self.delegates.get_mut(&region_id) {
+                delegate = d;
+            } else {
+                error!("[region {}] is missing", region_id);
+                continue;
             }
-
-            // Advance applied index and term.
-            let apply_state = self
-                .apply_states
-                .entry(region_id)
-                .or_insert_with(ApplyState::default);
-            debug!(
-                "[region {}] advance applied index {} and term {}",
-                region_id,
-                header.get_index(),
-                header.get_term()
-            );
-            apply_state.state.set_applied_index(header.get_index());
-            apply_state.applied_term = header.get_term();
-        }
-    }
-
-    fn handle_put(&mut self, region_id: u64, req: &Request) {
-        let (key, value) = (req.get_put().get_key(), req.get_put().get_value());
-
-        let key = keys::data_key(key);
-        if !req.get_put().get_cf().is_empty() {
-            let cf = req.get_put().get_cf();
-            rocksdb_util::get_cf_handle(&self.db, cf)
-                .and_then(|handle| self.wb.put_cf(handle, &key, value))
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "[region {}] failed to write ({}, {}) to cf {}: {:?}",
-                        region_id,
-                        escape(&key),
-                        escape(value),
-                        cf,
-                        e
-                    )
-                });
-        } else {
-            self.wb.put(&key, value).unwrap_or_else(|e| {
-                panic!(
-                    "[region {}] failed to write ({}, {}): {:?}",
-                    region_id,
-                    escape(&key),
-                    escape(value),
-                    e
-                );
-            });
-        }
-    }
-
-    fn handle_delete(&mut self, region_id: u64, req: &Request) {
-        let key = req.get_delete().get_key();
-
-        let key = keys::data_key(key);
-        if !req.get_delete().get_cf().is_empty() {
-            let cf = req.get_delete().get_cf();
-            // TODO: check whether cf exists or not.
-            rocksdb_util::get_cf_handle(&self.db, cf)
-                .and_then(|handle| self.wb.delete_cf(handle, &key))
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "[region {}] failed to delete {}: {:?}",
-                        region_id,
-                        escape(&key),
-                        e
-                    )
-                });
-        } else {
-            self.wb.delete(&key).unwrap_or_else(|e| {
-                panic!(
-                    "[region {}] failed to delete {}: {:?}",
-                    region_id,
-                    escape(&key),
-                    e
-                )
-            });
+            if delegate.pending_remove {
+                debug!("{} is pending remove, drop cmd {:?}", delegate.tag, cmd);
+                continue;
+            }
+            if delegate.apply_cmd(cmd, &self.db) {
+                self.pending_sync_delegates.insert(region_id);
+            }
         }
     }
 }
@@ -261,36 +437,65 @@ impl Runner {
 impl Runnable<Task> for Runner {
     fn run_batch(&mut self, batch: &mut Vec<Task>) {
         for task in batch.drain(..) {
-            self.pending_write_and_report = true;
             match task {
                 Task::Commands { commands } => {
                     self.apply_cmds(commands);
                 }
-                Task::Snapshot { mut state } => {
-                    let region_id = state.get_region().get_id();
-                    let apply_state = state.take_apply_state();
-                    info!(
-                        "[region {}] update apply state via snapshot {:?}",
-                        region_id, apply_state
-                    );
-                    self.apply_states
-                        .insert(region_id, ApplyState::from_raft_apply_state(apply_state));
+                Task::RegionMeta { meta } => {
+                    let region_id = meta.region.get_id();
+                    self.delegates
+                        .insert(region_id, Delegate::from_region_meta(meta));
                 }
             }
         }
     }
 
+    fn on_tick(&mut self) {
+        let mut resps = Vec::with_capacity(self.pending_sync_delegates.len());
+        for region_id in self.pending_sync_delegates.drain() {
+            let remove = {
+                let delegate = self.delegates.get_mut(&region_id).unwrap();
+                let resp = if delegate.pending_remove {
+                    delegate.destroy(&self.db)
+                } else {
+                    delegate.persist(&self.db)
+                };
+                resps.push(resp);
+                delegate.pending_remove
+            };
+            if remove {
+                info!("[region {}] is removed", region_id,);
+                self.delegates.remove(&region_id);
+            }
+        }
+        if !resps.is_empty() {
+            self.report_applied(resps);
+        }
+    }
+
     fn shutdown(&mut self) {
-        self.pending_write_and_report = true;
-        self.persist_and_report_apply();
+        info!(
+            "persist all apply delegates before shutdown, total: {}",
+            self.delegates.len()
+        );
+        let mut resps = Vec::with_capacity(self.pending_sync_delegates.len());
+        for delegate in &mut self.delegates.values_mut() {
+            resps.push(delegate.persist(&self.db));
+        }
+        if !resps.is_empty() {
+            self.report_applied(resps);
+        }
     }
 }
 
 impl RunnableWithTimer<Task, ()> for Runner {
     fn on_timeout(&mut self, timer: &mut Timer<()>, _: ()) {
-        self.persist_and_report_apply();
+        info!("persist apply delegates, total: {}", self.delegates.len());
+        for region_id in self.delegates.keys() {
+            self.pending_sync_delegates.insert(*region_id);
+        }
 
-        // report every 5 scends.
-        timer.add_task(Duration::from_secs(5), ());
+        // report every 30 scends.
+        timer.add_task(Duration::from_secs(PERSIST_INTERVAL), ());
     }
 }

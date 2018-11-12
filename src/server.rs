@@ -46,7 +46,8 @@ impl Engine for Service {
             .for_each(move |cmds| {
                 apply.schedule(ApplyTask::commands(cmds)).unwrap();
                 Ok(())
-            }).map_err(|e| {
+            })
+            .map_err(|e| {
                 error!("{:?}", e);
             });
 
@@ -59,7 +60,8 @@ impl Engine for Service {
         let resps = sink
             .sink_map_err(|e| {
                 error!("{:?}", e);
-            }).send_all(applied_receiver.map(|resp| (resp, WriteFlags::default())))
+            })
+            .send_all(applied_receiver.map(|resp| (resp, WriteFlags::default())))
             .map(|_| ())
             .map_err(|e| error!("{:?}", e));
 
@@ -79,7 +81,8 @@ impl Engine for Service {
             .for_each(move |chunk| {
                 sender.send(chunk).unwrap();
                 Ok(())
-            }).map_err(|e| {
+            })
+            .map_err(|e| {
                 error!("{:?}", e);
             });
 

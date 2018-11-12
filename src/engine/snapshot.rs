@@ -9,7 +9,7 @@ use rocksdb::{Writable, WriteBatch, WriteOptions, DB};
 use super::super::keys::{self, escape};
 use super::super::rocksdb_util;
 use super::super::worker::{Runnable, Scheduler};
-use super::{ApplyState, ApplyTask};
+use super::{ApplyTask, RegionMeta};
 
 pub struct Task {
     requests: Receiver<SnapshotRequest>,
@@ -90,12 +90,15 @@ impl Runner {
 
         // Persist snapshot data.
         let region_id = state.as_ref().unwrap().get_region().get_id();
-        let snapshot_state = state.unwrap();
+        let mut snapshot_state = state.unwrap();
 
+        let region_meta = RegionMeta::new(
+            snapshot_state.take_peer(),
+            snapshot_state.take_region(),
+            snapshot_state.take_apply_state(),
+        );
         let mut buffer = Vec::new();
-        let raft_apply_state = snapshot_state.get_apply_state();
-        let apply_state = ApplyState::from_raft_apply_state(raft_apply_state.clone());
-        apply_state.write_to(&mut buffer).unwrap();
+        region_meta.write_to(&mut buffer).unwrap();
 
         let region_key = keys::apply_state_key(region_id);
         wb.put(&region_key, &buffer).unwrap_or_else(|e| {
@@ -115,7 +118,7 @@ impl Runner {
         // Send snapshot state to apply worker.
         // TODO: notify apply state to tikv.
         self.apply_scheduler
-            .schedule(ApplyTask::snapshot(snapshot_state))
+            .schedule(ApplyTask::region_meta(region_meta))
             .unwrap();
 
         // Notify apply snapshot finished.

@@ -11,6 +11,7 @@ extern crate toml;
 extern crate log;
 extern crate byteorder;
 extern crate protobuf;
+extern crate raft;
 
 pub mod config;
 pub mod engine;
