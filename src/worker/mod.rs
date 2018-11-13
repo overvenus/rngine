@@ -244,12 +244,20 @@ fn poll<R, T, U>(
     T: Display + Send + 'static,
     U: Send + 'static,
 {
+    fn checked_sub(left: Instant, right: Instant) -> Option<Duration> {
+        if left >= right {
+            Some(left.duration_since(right))
+        } else {
+            None
+        }
+    }
+
     let mut batch = Vec::with_capacity(batch_size);
     let mut keep_going = true;
     let mut tick_time = None;
     while keep_going {
         tick_time = tick_time.or_else(|| timer.next_timeout());
-        let timeout = tick_time.map(|t| t.duration_since(Instant::now()));
+        let timeout = tick_time.map(|t| checked_sub(t, Instant::now()).unwrap_or_default());
 
         keep_going = fill_task_batch(&rx, &mut batch, batch_size, timeout);
         if !batch.is_empty() {
