@@ -64,7 +64,11 @@ impl Runner {
 
             if state.is_none() {
                 let s = chunk.take_state();
-                info!("applying snapshot, {:?}", s);
+                info!(
+                    "[region {}] applying snapshot, {:?}",
+                    s.get_region().get_id(),
+                    s,
+                );
                 state = Some(s);
                 continue;
             }
@@ -118,7 +122,7 @@ impl Runner {
         // Send snapshot state to apply worker.
         // TODO: notify apply state to tikv.
         self.apply_scheduler
-            .schedule(ApplyTask::region_meta(region_meta))
+            .schedule(ApplyTask::snap(region_meta))
             .unwrap();
 
         // Notify apply snapshot finished.

@@ -19,7 +19,7 @@ use super::{initial_apply_state, RegionMeta};
 
 pub enum Task {
     Commands { commands: CommandRequestBatch },
-    RegionMeta { meta: RegionMeta },
+    Snap { meta: RegionMeta },
 }
 
 impl Task {
@@ -27,8 +27,8 @@ impl Task {
         Task::Commands { commands }
     }
 
-    pub fn region_meta(meta: RegionMeta) -> Task {
-        Task::RegionMeta { meta }
+    pub fn snap(meta: RegionMeta) -> Task {
+        Task::Snap { meta }
     }
 }
 
@@ -388,17 +388,20 @@ impl Runner {
             }
             if let Some(metas) = metas {
                 for m in metas {
-                    self.insert_delegates(m);
+                    // The region is created by split.
+                    self.insert_delegates(m, false);
                 }
             }
         }
     }
 
-    fn insert_delegates(&mut self, meta: RegionMeta) {
+    fn insert_delegates(&mut self, meta: RegionMeta, report: bool) {
         let region_id = meta.region.get_id();
         self.delegates
             .insert(region_id, Delegate::from_region_meta(meta));
-        self.pending_sync_delegates.insert(region_id);
+        if report {
+            self.pending_sync_delegates.insert(region_id);
+        }
     }
 }
 
@@ -409,8 +412,9 @@ impl Runnable<Task> for Runner {
                 Task::Commands { commands } => {
                     self.apply_cmds(commands);
                 }
-                Task::RegionMeta { meta } => {
-                    self.insert_delegates(meta);
+                Task::Snap { meta } => {
+                    // The region is created by snapshot.
+                    self.insert_delegates(meta, true);
                 }
             }
         }
