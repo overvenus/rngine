@@ -7,8 +7,8 @@ use futures::sync::mpsc::UnboundedReceiver;
 use futures::sync::oneshot;
 use futures::{Future, Sink, Stream};
 use grpcio::{
-    ClientStreamingSink, DuplexSink, EnvBuilder, Environment, RequestStream, RpcContext,
-    Server as GrpcServer, ServerBuilder, WriteFlags,
+    ChannelBuilder, ClientStreamingSink, DuplexSink, EnvBuilder, Environment, RequestStream,
+    RpcContext, Server as GrpcServer, ServerBuilder, WriteFlags,
 };
 use kvproto::enginepb::{CommandRequestBatch, CommandResponseBatch, SnapshotDone, SnapshotRequest};
 use kvproto::enginepb_grpc::*;
@@ -105,11 +105,16 @@ impl Server {
     pub fn start(addr: &str, svc: Service) -> Server {
         let env = EnvBuilder::new().cq_count(1).name_prefix("rg").build();
         let env = Arc::new(env);
+        let args = ChannelBuilder::new(env.clone())
+            .max_receive_message_len(-1)
+            .max_send_message_len(-1)
+            .build_args();
         let addr = SocketAddr::from_str(addr).unwrap();
         info!("listening on {}", addr);
         let ip = format!("{}", addr.ip());
         let mut server = ServerBuilder::new(env.clone())
             .register_service(create_engine(svc))
+            .channel_args(args)
             .bind(ip, addr.port())
             .build()
             .unwrap();
