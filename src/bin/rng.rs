@@ -12,7 +12,7 @@ extern crate slog;
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{panic, process, thread};
 
 use clap::{App, Arg, ArgMatches};
@@ -84,12 +84,12 @@ fn main() {
     overwrite_config_with_cmd_args(&mut config, &matches);
 
     // Install logger.
-    let _guard = init_log(&config);
+    let guard = init_log(&config);
 
     info!("Welcome to Rng");
 
     // Install panic hook. Abort on panic.
-    set_panic_hook(true);
+    set_panic_hook(true, guard);
 
     let root_path = Path::new(&config.path);
     // Create root directory if missing.
@@ -161,7 +161,7 @@ fn overwrite_config_with_cmd_args(config: &mut RgConfig, matches: &ArgMatches) {
 }
 
 // Exit the whole process when panic.
-fn set_panic_hook(panic_abort: bool) {
+fn set_panic_hook(panic_abort: bool, guard: GlobalLoggerGuard) {
     // HACK! New a backtrace ahead for caching necessary elf sections of this
     // tikv-server, in case it can not open more files during panicking
     // which leads to no stack info (0x5648bdfe4ff2 - <no info>).
@@ -176,6 +176,9 @@ fn set_panic_hook(panic_abort: bool) {
         .name("backtrace-loader".to_owned())
         .spawn(::backtrace::Backtrace::new)
         .unwrap();
+
+    // Hold the guard.
+    let log_guard = Mutex::new(Some(guard));
 
     let orig_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info: &panic::PanicInfo| {
@@ -203,6 +206,9 @@ fn set_panic_hook(panic_abort: bool) {
         } else {
             orig_hook(info);
         }
+
+        // To collect remaining logs, drop the guard before exit.
+        drop(log_guard.lock().unwrap().take());
 
         if panic_abort {
             process::abort();
