@@ -199,6 +199,10 @@ pub fn initial_apply_state() -> RaftApplyState {
 
 #[cfg(test)]
 mod tests {
+    use kvproto::metapb;
+
+    use super::*;
+
     #[test]
     fn test_region_meta_serde() {
         let applied_term = 20181108;
