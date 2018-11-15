@@ -87,6 +87,7 @@ fn main() {
     let guard = init_log(&config);
 
     info!("Welcome to Rng");
+    info!("Config:\n{}", toml::to_string_pretty(&config).unwrap());
 
     // Install panic hook. Abort on panic.
     set_panic_hook(true, guard);
@@ -122,7 +123,7 @@ fn main() {
     );
 
     let mut engine = Engine::new(db);
-    engine.start();
+    engine.start(&config);
     let service = Service::new(&mut engine);
     let _server = Server::start(&config.address, service);
 

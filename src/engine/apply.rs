@@ -294,8 +294,6 @@ fn find_peer(region: &metapb::Region, store_id: u64) -> Option<&metapb::Peer> {
         .find(|&p| p.get_store_id() == store_id)
 }
 
-const PERSIST_INTERVAL: u64 = 30; // 30 seconds.
-
 pub struct Runner {
     db: Arc<DB>,
     notifier: UnboundedSender<CommandResponseBatch>,
@@ -303,13 +301,19 @@ pub struct Runner {
     // region id -> apply state
     delegates: HashMap<u64, Delegate>,
     pending_sync_delegates: HashSet<u64>,
+    persist_interval: Duration,
 }
 
 impl Runner {
-    pub fn new(db: Arc<DB>, notifier: UnboundedSender<CommandResponseBatch>) -> Runner {
+    pub fn new(
+        db: Arc<DB>,
+        notifier: UnboundedSender<CommandResponseBatch>,
+        persist_interval: Duration,
+    ) -> Runner {
         let mut runner = Runner {
             db,
             notifier,
+            persist_interval,
             delegates: HashMap::new(),
             pending_sync_delegates: HashSet::new(),
         };
@@ -323,7 +327,7 @@ impl Runner {
     pub fn timer(&self) -> Timer<()> {
         let mut timer = Timer::new(1);
 
-        timer.add_task(Duration::from_secs(PERSIST_INTERVAL), ());
+        timer.add_task(self.persist_interval, ());
         timer
     }
 
@@ -465,7 +469,6 @@ impl RunnableWithTimer<Task, ()> for Runner {
             self.pending_sync_delegates.insert(*region_id);
         }
 
-        // report every 30 scends.
-        timer.add_task(Duration::from_secs(PERSIST_INTERVAL), ());
+        timer.add_task(self.persist_interval, ());
     }
 }

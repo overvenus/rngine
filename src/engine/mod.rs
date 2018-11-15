@@ -9,6 +9,7 @@ use kvproto::raft_serverpb::RaftApplyState;
 use protobuf::Message;
 use rocksdb::DB;
 
+use super::config;
 use super::worker::{Scheduler, Worker};
 
 mod apply;
@@ -42,10 +43,10 @@ impl Engine {
         self.snapshot_worker.scheduler()
     }
 
-    pub fn start(&mut self) {
+    pub fn start(&mut self, cfg: &config::RgConfig) {
         let (tx, rx) = unbounded();
         self.applied_receiver = Some(rx);
-        let apply_runner = ApplyRunner::new(self.db.clone(), tx);
+        let apply_runner = ApplyRunner::new(self.db.clone(), tx, cfg.persist_interval.0);
         let apply_timer = apply_runner.timer();
         self.apply_worker
             .start_with_timer(apply_runner, apply_timer)

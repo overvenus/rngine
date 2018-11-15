@@ -22,10 +22,13 @@ use super::rocksdb_util::{CFOptions, CF_DEFAULT, CF_LOCK, CF_WRITE};
 pub struct RgConfig {
     pub path: String,
     pub address: String,
-    pub rocksdb: DbConfig,
 
     pub log_file: String,
     pub log_rotation_timespan: ReadableDuration,
+
+    pub persist_interval: ReadableDuration,
+
+    pub rocksdb: DbConfig,
 }
 
 impl RgConfig {
@@ -56,6 +59,7 @@ impl Default for RgConfig {
             path: "./data".to_owned(),
             address: "127.0.0.1:3930".to_owned(),
             rocksdb: DbConfig::default(),
+            persist_interval: ReadableDuration::minutes(1),
             log_file: "./rngine.log".to_owned(),
             log_rotation_timespan: ReadableDuration::hours(24),
         }
