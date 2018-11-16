@@ -462,3 +462,112 @@ impl RunnableWithTimer<Task, ()> for Runner {
         timer.add_task(self.persist_interval, ());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use kvproto::raft_cmdpb::{BatchSplitRequest, SplitRequest};
+    use tempdir::TempDir;
+
+    use super::*;
+
+    fn create_tmp_db(path: &str) -> (TempDir, Arc<DB>) {
+        let path = TempDir::new(path).unwrap();
+        let db = Arc::new(
+            rocksdb_util::new_engine(
+                path.path().join("db").to_str().unwrap(),
+                rocksdb_util::ALL_CFS,
+                None,
+            )
+            .unwrap(),
+        );
+        (path, db)
+    }
+
+    fn new_split_req(key: &[u8], id: u64, children: Vec<u64>) -> SplitRequest {
+        let mut req = SplitRequest::new();
+        req.set_split_key(key.to_vec());
+        req.set_new_region_id(id);
+        req.set_new_peer_ids(children);
+        req
+    }
+
+    #[test]
+    fn test_split() {
+        let (_tmp, db) = create_tmp_db("apply-basic");
+        let (notifier, _rx) = futures::sync::mpsc::unbounded();
+        let mut runner = Runner::new(db.clone(), notifier, Duration::from_secs(1));
+
+        let mut peer2 = metapb::Peer::new();
+        peer2.set_id(2);
+        let mut peer3 = metapb::Peer::new();
+        peer3.set_id(3);
+        peer3.set_is_learner(true);
+        let mut region1 = metapb::Region::new();
+        region1.set_id(1);
+        region1.set_peers(vec![peer2.clone(), peer3.clone()].into());
+        let apply_state = initial_apply_state();
+
+        let meta = RegionMeta::new(peer3, region1.clone(), apply_state);
+        runner.delegates.insert(1, Delegate::from_region_meta(meta));
+
+        // split region 1 to region4["", "k1") and region1["k1", "")
+        let mut admin = AdminRequest::new();
+        admin.set_cmd_type(AdminCmdType::BatchSplit);
+        let mut splits = BatchSplitRequest::new();
+        splits.set_right_derive(true);
+        splits
+            .mut_requests()
+            .push(new_split_req(b"k1", 4, vec![5, 6]));
+        admin.set_splits(splits);
+
+        let mut peer5 = metapb::Peer::new();
+        peer5.set_id(5);
+        let mut peer6 = metapb::Peer::new();
+        peer6.set_id(6);
+        peer6.set_is_learner(true);
+        let mut region4 = metapb::Region::new();
+        region4.set_id(4);
+        region4.set_peers(vec![peer5.clone(), peer6.clone()].into());
+        region4.set_end_key("k1".into());
+
+        let mut admin_resp = AdminResponse::new();
+        region1.set_start_key("k1".into());
+        admin_resp
+            .mut_splits()
+            .set_regions(vec![region1, region4].into());
+
+        let mut req = CommandRequest::new();
+        req.mut_header().set_region_id(1);
+        req.mut_header().set_index(100);
+        req.mut_header().set_term(100);
+        req.mut_header().set_sync_log(true);
+        req.set_admin_request(admin);
+        req.set_admin_response(admin_resp);
+
+        let mut cmd = CommandRequestBatch::new();
+        cmd.set_requests(vec![req].into());
+
+        let split_task = Task::commands(cmd);
+
+        runner.run_batch(&mut vec![split_task]);
+        assert!(runner.pending_sync_delegates.contains(&1));
+        assert!(!runner.pending_sync_delegates.contains(&4));
+
+        // runner persist pending sync region in on_tick.
+        assert!(!runner.delegates.get(&1).unwrap().wb.is_empty());
+        assert!(runner.delegates.get(&4).is_some());
+        runner.on_tick();
+        assert!(runner.delegates.get(&1).unwrap().wb.is_empty());
+
+        // Make sure splitted regions and split commands are applied atomically.
+        let key_r1 = keys::apply_state_key(1);
+        let value1 = db.get(&key_r1).unwrap().unwrap();
+        let meta1 = RegionMeta::parse(&*value1);
+        assert_eq!(meta1, runner.delegates.get(&1).unwrap().meta);
+
+        let key_r4 = keys::apply_state_key(4);
+        let value4 = db.get(&key_r4).unwrap().unwrap();
+        let meta4 = RegionMeta::parse(&*value4);
+        assert_eq!(meta4, runner.delegates.get(&4).unwrap().meta);
+    }
+}

@@ -49,3 +49,6 @@ branch = "ov/engine"
 
 [dependencies.rocksdb]
 git = "https://github.com/pingcap/rust-rocksdb.git"
+
+[dev-dependencies]
+tempdir = "0.3"
