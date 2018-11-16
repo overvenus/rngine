@@ -19,8 +19,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{self, DateTime, Duration, Utc};
 use grpcio;
-use log;
-use log::SetLoggerError;
+use log::{self, SetLoggerError};
 use slog::{self, Drain, Key, OwnedKVList, Record, KV};
 use slog_scope::{self, GlobalLoggerGuard};
 use slog_stdlog;
