@@ -23,6 +23,8 @@ pub struct RgConfig {
     pub path: String,
     pub address: String,
 
+    #[serde(with = "log_level_serde")]
+    pub log_level: slog::Level,
     pub log_file: String,
     pub log_rotation_timespan: ReadableDuration,
 
@@ -62,6 +64,7 @@ impl Default for RgConfig {
             persist_interval: ReadableDuration::minutes(1),
             log_file: "./rngine.log".to_owned(),
             log_rotation_timespan: ReadableDuration::hours(24),
+            log_level: slog::Level::Info,
         }
     }
 }
@@ -798,4 +801,57 @@ pub fn duration_to_nanos(d: Duration) -> u64 {
     let nanos = u64::from(d.subsec_nanos());
     // Most of case, we can't have so large Duration, so here just panic if overflow now.
     d.as_secs() * 1_000_000_000 + nanos
+}
+
+pub mod log_level_serde {
+    use serde::{
+        de::{Error, Unexpected},
+        Deserialize, Deserializer, Serialize, Serializer,
+    };
+    use slog::Level;
+
+    use super::*;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Level, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let string = String::deserialize(deserializer)?;
+        get_level_by_string(&string)
+            .ok_or_else(|| D::Error::invalid_value(Unexpected::Str(&string), &"a valid log level"))
+    }
+
+    #[cfg_attr(feature = "cargo-clippy", allow(trivially_copy_pass_by_ref))]
+    pub fn serialize<S>(value: &Level, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        get_string_by_level(*value).serialize(serializer)
+    }
+}
+
+pub fn get_level_by_string(lv: &str) -> Option<slog::Level> {
+    match &*lv.to_owned().to_lowercase() {
+        "critical" => Some(slog::Level::Critical),
+        "error" => Some(slog::Level::Error),
+        // We support `warn` due to legacy.
+        "warning" | "warn" => Some(slog::Level::Warning),
+        "debug" => Some(slog::Level::Debug),
+        "trace" => Some(slog::Level::Trace),
+        "info" => Some(slog::Level::Info),
+        _ => None,
+    }
+}
+
+// The `to_string()` function of `slog::Level` produces values like `erro` and `trce` instead of
+// the full words. This produces the full word.
+fn get_string_by_level(lv: slog::Level) -> &'static str {
+    match lv {
+        slog::Level::Critical => "critical",
+        slog::Level::Error => "error",
+        slog::Level::Warning => "warning",
+        slog::Level::Debug => "debug",
+        slog::Level::Trace => "trace",
+        slog::Level::Info => "info",
+    }
 }

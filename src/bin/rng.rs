@@ -22,7 +22,7 @@ use slog_async::{Async, OverflowStrategy};
 use slog_scope::GlobalLoggerGuard;
 use slog_term::{PlainDecorator, TermDecorator};
 
-use rngine::config::RgConfig;
+use rngine::config::{get_level_by_string, RgConfig};
 use rngine::engine::Engine;
 use rngine::logger;
 use rngine::rocksdb_util;
@@ -65,6 +65,18 @@ fn main() {
                 .value_name("FILE")
                 .help("Sets log file")
                 .long_help("Sets log file. If not set, output log to stderr"),
+        )
+        .arg(
+            Arg::with_name("log-level")
+                .short("L")
+                .long("log-level")
+                .alias("log")
+                .takes_value(true)
+                .value_name("LEVEL")
+                .possible_values(&[
+                    "trace", "debug", "info", "warn", "warning", "error", "critical",
+                ])
+                .help("Sets log level"),
         )
         .arg(
             Arg::with_name("print-sample-config")
@@ -159,6 +171,10 @@ fn overwrite_config_with_cmd_args(config: &mut RgConfig, matches: &ArgMatches) {
     if let Some(log_file) = matches.value_of("log-file") {
         config.log_file = log_file.to_owned();
     }
+
+    if let Some(log_level) = matches.value_of("log-level") {
+        config.log_level = get_level_by_string(log_level).unwrap();
+    }
 }
 
 // Exit the whole process when panic.
@@ -231,8 +247,7 @@ pub fn init_log(config: &RgConfig) -> GlobalLoggerGuard {
         chrono::Duration::from_std(config.log_rotation_timespan.clone().into())
             .expect("config.log_rotation_timespan is an invalid duration.");
 
-    // TODO: add it config.
-    let log_level = slog::Level::Debug;
+    let log_level = config.log_level;
 
     let guard = if config.log_file.is_empty() {
         let decorator = TermDecorator::new().build();

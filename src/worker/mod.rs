@@ -140,7 +140,7 @@ impl<T: Display> Scheduler<T> {
     ///
     /// If the worker is stopped or number pending tasks exceeds capacity, an error will return.
     pub fn schedule(&self, task: T) -> Result<(), ScheduleError<T>> {
-        debug!("scheduling task {}", task);
+        trace!("scheduling task {}", task);
         if let Err(e) = self.sender.try_send(Some(task)) {
             match e {
                 TrySendError::Disconnected(Some(t)) => return Err(ScheduleError::Stopped(t)),
