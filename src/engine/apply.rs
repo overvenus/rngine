@@ -15,7 +15,7 @@ use rocksdb::{DBIterator, Writable, WriteBatch, WriteOptions, DB};
 use super::super::keys::{self, escape};
 use super::super::rocksdb_util::{self, CF_DEFAULT};
 use super::super::worker::{Runnable, RunnableWithTimer, Timer};
-use super::{initial_apply_state, RegionMeta};
+use super::{initial_apply_state, write_region_meta, RegionMeta};
 
 pub enum Task {
     Commands { commands: CommandRequestBatch },
@@ -66,17 +66,7 @@ impl Delegate {
             self.tag, self.meta.apply_state
         );
 
-        let apply_state_key = keys::apply_state_key(self.meta.region.get_id());
-        let mut buffer = Vec::new();
-        self.meta.write_to(&mut buffer).unwrap();
-        self.wb.put(&apply_state_key, &buffer).unwrap_or_else(|e| {
-            panic!(
-                "{} failed to persist apply state {}: {:?}",
-                self.tag,
-                escape(&apply_state_key),
-                e
-            )
-        });
+        write_region_meta(&self.meta, &self.wb);
 
         let mut write_opts = WriteOptions::new();
         write_opts.set_sync(true);
@@ -280,7 +270,10 @@ impl Delegate {
             } else {
                 let peer = find_peer(&r, store_id).unwrap();
                 let apply_state = initial_apply_state();
-                metas.push(RegionMeta::new(peer.to_owned(), r, apply_state));
+                let meta = RegionMeta::new(peer.to_owned(), r, apply_state);
+                // Write new region metas and batch split in the same write.
+                write_region_meta(&meta, &self.wb);
+                metas.push(meta);
             }
         }
         Some(metas)
@@ -393,19 +386,16 @@ impl Runner {
             if let Some(metas) = metas {
                 for m in metas {
                     // The region is created by split.
-                    self.insert_delegates(m, false);
+                    self.insert_delegates(m);
                 }
             }
         }
     }
 
-    fn insert_delegates(&mut self, meta: RegionMeta, report: bool) {
+    fn insert_delegates(&mut self, meta: RegionMeta) {
         let region_id = meta.region.get_id();
         self.delegates
             .insert(region_id, Delegate::from_region_meta(meta));
-        if report {
-            self.pending_sync_delegates.insert(region_id);
-        }
     }
 }
 
@@ -418,7 +408,7 @@ impl Runnable<Task> for Runner {
                 }
                 Task::Snap { meta } => {
                     // The region is created by snapshot.
-                    self.insert_delegates(meta, true);
+                    self.insert_delegates(meta);
                 }
             }
         }

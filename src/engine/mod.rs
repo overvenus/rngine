@@ -7,10 +7,10 @@ use kvproto::enginepb::{CommandResponse, CommandResponseBatch, CommandResponseHe
 use kvproto::metapb;
 use kvproto::raft_serverpb::RaftApplyState;
 use protobuf::Message;
-use rocksdb::DB;
+use rocksdb::{Writable, WriteBatch, DB};
 
-use super::config;
 use super::worker::{Scheduler, Worker};
+use super::{config, keys};
 
 mod apply;
 mod snapshot;
@@ -176,6 +176,21 @@ impl RegionMeta {
         resp.set_applied_term(self.applied_term);
         resp
     }
+}
+
+pub fn write_region_meta(meta: &RegionMeta, wb: &WriteBatch) {
+    let region_id = meta.region.get_id();
+    let apply_state_key = keys::apply_state_key(region_id);
+    let mut buffer = Vec::new();
+    meta.write_to(&mut buffer).unwrap();
+    wb.put(&apply_state_key, &buffer).unwrap_or_else(|e| {
+        panic!(
+            "[region {}] failed to persist apply state {}: {:?}",
+            region_id,
+            keys::escape(&apply_state_key),
+            e
+        )
+    });
 }
 
 // When we create a region peer, we should initialize its log term/index > 0,
