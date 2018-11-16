@@ -9,7 +9,7 @@ use rocksdb::{Writable, WriteBatch, WriteOptions, DB};
 use super::super::keys::{self, escape};
 use super::super::rocksdb_util;
 use super::super::worker::{Runnable, Scheduler};
-use super::{ApplyTask, RegionMeta};
+use super::{write_region_meta, ApplyTask, RegionMeta};
 
 pub struct Task {
     requests: Receiver<SnapshotRequest>,
@@ -101,18 +101,9 @@ impl Runner {
             snapshot_state.take_region(),
             snapshot_state.take_apply_state(),
         );
-        let mut buffer = Vec::new();
-        region_meta.write_to(&mut buffer).unwrap();
 
-        let region_key = keys::apply_state_key(region_id);
-        wb.put(&region_key, &buffer).unwrap_or_else(|e| {
-            panic!(
-                "[region {}] failed to apply snapshot {}: {:?}",
-                region_id,
-                escape(&region_key),
-                e
-            )
-        });
+        write_region_meta(&region_meta, &wb);
+
         let mut write_opts = WriteOptions::new();
         write_opts.set_sync(true);
         self.db.write_opt(wb, &write_opts).unwrap_or_else(|e| {
@@ -120,7 +111,6 @@ impl Runner {
         });
 
         // Send snapshot state to apply worker.
-        // TODO: notify apply state to tikv.
         self.apply_scheduler
             .schedule(ApplyTask::snap(region_meta))
             .unwrap();
