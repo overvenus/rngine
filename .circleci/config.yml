@@ -1,0 +1,22 @@
+version: 2
+jobs:
+  rust:
+    docker:
+      - image: circleci/rust:stretch
+    environment:
+      RUST_BACKTRACE: "1"
+      RUSTFLAGS: "-Dwarnings"
+      # Avoid OOM.
+      NUM_JOBS: 2
+    steps:
+      - checkout
+      - run: sudo apt-get update && sudo apt-get install -y cmake golang libgflags-dev
+      # Rust 2018 edition is only available on nightly.
+      - run: rustup override set nightly
+      - run: cargo test --all -j 2 -vv
+
+workflows:
+  version: 2
+  ci-test:
+      jobs:
+        - rust
