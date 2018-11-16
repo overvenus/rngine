@@ -21,6 +21,9 @@ extern crate slog_scope;
 extern crate slog_stdlog;
 extern crate slog_term;
 
+#[cfg(test)]
+extern crate tempdir;
+
 pub mod config;
 pub mod engine;
 pub mod keys;
