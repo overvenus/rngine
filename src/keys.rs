@@ -40,6 +40,9 @@ const REGION_RAFT_PREFIX_KEY: &[u8] = &[LOCAL_PREFIX, REGION_RAFT_PREFIX];
 pub const REGION_RAFT_MIN_KEY: &[u8] = &[LOCAL_PREFIX, REGION_RAFT_PREFIX];
 pub const REGION_RAFT_MAX_KEY: &[u8] = &[LOCAL_PREFIX, REGION_RAFT_PREFIX + 1];
 
+pub const REGION_META_PREFIX: u8 = 0x03;
+pub const REGION_META_PREFIX_KEY: &[u8] = &[LOCAL_PREFIX, REGION_META_PREFIX];
+
 // Following are the suffix after the local prefix.
 // For region id
 // const RAFT_LOG_SUFFIX: u8 = 0x01;
@@ -59,6 +62,19 @@ fn make_region_prefix(region_id: u64, suffix: u8) -> [u8; 11] {
     BigEndian::write_u64(&mut key[2..10], region_id);
     key[10] = suffix;
     key
+}
+
+#[inline]
+fn make_region_meta_key(region_id: u64, suffix: u8) -> [u8; 11] {
+    let mut key = [0; 11];
+    key[0..2].copy_from_slice(REGION_META_PREFIX_KEY);
+    BigEndian::write_u64(&mut key[2..10], region_id);
+    key[10] = suffix;
+    key
+}
+
+pub fn region_state_key(region_id: u64) -> [u8; 11] {
+    make_region_meta_key(region_id, REGION_STATE_SUFFIX)
 }
 
 pub fn apply_state_key(region_id: u64) -> [u8; 11] {

@@ -34,6 +34,7 @@ protobuf = "~2.0"
 env_logger = "0.5"
 backtrace = "0.2.3"
 raft = "0.3"
+crc = "1.8"
 
 chrono = "0.4"
 log = { version = "0.3", features = ["release_max_level_debug"] }

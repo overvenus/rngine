@@ -13,9 +13,11 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use rocksdb::load_latest_options;
 use rocksdb::rocksdb::supported_compression;
+use rocksdb::rocksdb_options::UnsafeSnap;
 use rocksdb::CFHandle;
 use rocksdb::{
     CColumnFamilyDescriptor, ColumnFamilyOptions, CompactOptions, DBCompressionType, DBIterator,
@@ -314,6 +316,83 @@ impl Default for IterOption {
     }
 }
 
+pub struct Snapshot {
+    db: Arc<DB>,
+    snap: UnsafeSnap,
+}
+
+unsafe impl Send for Snapshot {}
+unsafe impl Sync for Snapshot {}
+
+impl Snapshot {
+    pub fn new(db: Arc<DB>) -> Snapshot {
+        unsafe {
+            Snapshot {
+                snap: db.unsafe_snap(),
+                db,
+            }
+        }
+    }
+
+    pub fn cf_names(&self) -> Vec<&str> {
+        self.db.cf_names()
+    }
+
+    pub fn cf_handle(&self, cf: &str) -> Result<&CFHandle, String> {
+        get_cf_handle(&self.db, cf)
+    }
+
+    pub fn get_db(&self) -> Arc<DB> {
+        Arc::clone(&self.db)
+    }
+
+    pub fn db_iterator(&self, iter_opt: IterOption) -> DBIterator<Arc<DB>> {
+        let mut opt = iter_opt.build_read_opts();
+        unsafe {
+            opt.set_snapshot(&self.snap);
+        }
+        DBIterator::new(Arc::clone(&self.db), opt)
+    }
+
+    pub fn db_iterator_cf(
+        &self,
+        cf: &str,
+        iter_opt: IterOption,
+    ) -> Result<DBIterator<Arc<DB>>, String> {
+        let handle = get_cf_handle(&self.db, cf)?;
+        let mut opt = iter_opt.build_read_opts();
+        unsafe {
+            opt.set_snapshot(&self.snap);
+        }
+        Ok(DBIterator::new_cf(Arc::clone(&self.db), handle, opt))
+    }
+
+    fn new_iterator_cf(&self, cf: &str, iter_opt: IterOption) -> Result<DBIterator<&DB>, String> {
+        let handle = get_cf_handle(&self.db, cf)?;
+        let mut opt = iter_opt.build_read_opts();
+        unsafe {
+            opt.set_snapshot(&self.snap);
+        }
+        Ok(DBIterator::new_cf(&self.db, handle, opt))
+    }
+
+    pub fn scan_cf<F>(
+        &self,
+        cf: &str,
+        start_key: &[u8],
+        end_key: &[u8],
+        fill_cache: bool,
+        f: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<bool, String>,
+    {
+        let iter_opt =
+            IterOption::new(Some(start_key.to_vec()), Some(end_key.to_vec()), fill_cache);
+        scan_db_iterator(self.new_iterator_cf(cf, iter_opt)?, start_key, f)
+    }
+}
+
 /// Compact the cf in the specified range by manual or not.
 pub fn compact_range(
     db: &DB,
@@ -336,4 +415,14 @@ pub fn delete_all_in_range(db: &DB, start_key: &[u8], end_key: &[u8], wb: &Write
         let handle = get_cf_handle(db, cf).unwrap();
         wb.delete_range_cf(handle, start_key, end_key).unwrap();
     }
+}
+
+#[cfg(test)]
+use tempdir::TempDir;
+
+#[cfg(test)]
+pub fn create_tmp_db(path: &str) -> (TempDir, Arc<DB>) {
+    let path = TempDir::new(path).unwrap();
+    let db = Arc::new(new_engine(path.path().join("db").to_str().unwrap(), ALL_CFS, None).unwrap());
+    (path, db)
 }

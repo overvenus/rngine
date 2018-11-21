@@ -13,14 +13,17 @@ use super::worker::{Scheduler, Worker};
 use super::{config, keys};
 
 mod apply;
+mod consistency;
 mod snapshot;
 
 pub use self::apply::{Runner as ApplyRunner, Task as ApplyTask};
+pub use self::consistency::{Runner as ConsistencyRunner, Task as ConsistencyTask};
 pub use self::snapshot::{Runner as SnapshotRunner, Task as SnapshotTask};
 
 pub struct Engine {
     db: Arc<DB>,
     apply_worker: Worker<ApplyTask>,
+    consistency_worker: Worker<ConsistencyTask>,
     snapshot_worker: Worker<SnapshotTask>,
     applied_receiver: Option<UnboundedReceiver<CommandResponseBatch>>,
 }
@@ -31,6 +34,7 @@ impl Engine {
             db,
             apply_worker: Worker::new("apply-worker"),
             snapshot_worker: Worker::new("snapshot-worker"),
+            consistency_worker: Worker::new("consistency-worker"),
             applied_receiver: None,
         }
     }
@@ -44,9 +48,17 @@ impl Engine {
     }
 
     pub fn start(&mut self, cfg: &config::RgConfig) {
+        let consistency_runner = ConsistencyRunner::new();
+        self.consistency_worker.start(consistency_runner).unwrap();
+
         let (tx, rx) = unbounded();
         self.applied_receiver = Some(rx);
-        let apply_runner = ApplyRunner::new(self.db.clone(), tx, cfg.persist_interval.0);
+        let apply_runner = ApplyRunner::new(
+            self.db.clone(),
+            tx,
+            cfg.persist_interval.0,
+            self.consistency_worker.scheduler(),
+        );
         let apply_timer = apply_runner.timer();
         self.apply_worker
             .start_with_timer(apply_runner, apply_timer)
