@@ -7,6 +7,7 @@ extern crate serde;
 #[macro_use]
 extern crate serde_derive;
 extern crate byteorder;
+extern crate crc;
 extern crate protobuf;
 extern crate raft;
 extern crate toml;

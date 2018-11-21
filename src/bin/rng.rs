@@ -134,6 +134,7 @@ fn main() {
             .unwrap_or_else(|s| panic!("failed to create kv engine: {:?}", s)),
     );
 
+    info!("Starting Rng ...");
     let mut engine = Engine::new(db);
     engine.start(&config);
     let service = Service::new(&mut engine);

@@ -13,8 +13,9 @@ use raft::eraftpb;
 use rocksdb::{DBIterator, Writable, WriteBatch, WriteOptions, DB};
 
 use super::super::keys::{self, escape};
-use super::super::rocksdb_util::{self, CF_DEFAULT};
-use super::super::worker::{Runnable, RunnableWithTimer, Timer};
+use super::super::rocksdb_util::{self, Snapshot, CF_DEFAULT};
+use super::super::worker::{Runnable, RunnableWithTimer, Scheduler, Timer};
+use super::ConsistencyTask;
 use super::{initial_apply_state, write_region_meta, RegionMeta};
 
 pub enum Task {
@@ -38,12 +39,29 @@ impl fmt::Display for Task {
     }
 }
 
+enum ExecRes {
+    Split {
+        splitted_region_metas: Vec<RegionMeta>,
+    },
+    ComputeHash {
+        index: u64,
+        region: metapb::Region,
+        raft_local_state: Vec<u8>,
+    },
+    VerifyHash {
+        index: u64,
+        region: metapb::Region,
+        hash: Vec<u8>,
+    },
+}
+
 const DEFAULT_APPLY_WB_SIZE: usize = 4 * 1024;
 
 struct Delegate {
     meta: RegionMeta,
     wb: WriteBatch,
     pending_remove: bool,
+    pending_exec_res: Option<ExecRes>,
 
     tag: String,
 }
@@ -55,6 +73,7 @@ impl Delegate {
         Delegate {
             meta,
             wb: WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE),
+            pending_exec_res: None,
             pending_remove: false,
             tag,
         }
@@ -112,13 +131,13 @@ impl Delegate {
         self.meta.to_command_response()
     }
 
-    fn apply_cmd(&mut self, mut cmd: CommandRequest, db: &DB) -> (bool, Option<Vec<RegionMeta>>) {
+    fn apply_cmd(&mut self, mut cmd: CommandRequest, db: &DB) -> bool {
         assert!(!self.pending_remove);
-        let header = cmd.take_header();
+        let mut header = cmd.take_header();
         let term = header.get_term();
         let index = header.get_index();
 
-        let mut metas = None;
+        let mut exec_res = None;
         if cmd.has_admin_request() {
             let request = cmd.take_admin_request();
             let response = cmd.take_admin_response();
@@ -132,9 +151,16 @@ impl Delegate {
             assert!(header.get_sync_log());
             match cmd_type {
                 AdminCmdType::ChangePeer => self.exec_change_peer(&request, response),
-                AdminCmdType::BatchSplit => metas = self.exec_batch_split(&request, response),
+                AdminCmdType::BatchSplit => exec_res = self.exec_batch_split(&request, response),
                 // To support compact log, we need to persist all changes to disk.
                 AdminCmdType::CompactLog => (),
+                AdminCmdType::ComputeHash => {
+                    let ctx = header.take_context();
+                    exec_res = self.exec_compute_hash(index, ctx);
+                }
+                AdminCmdType::VerifyHash => {
+                    exec_res = self.exec_verify_hash(&request);
+                }
                 other => {
                     error!("unsupported admin command type {:?}", other);
                 }
@@ -165,7 +191,11 @@ impl Delegate {
         self.meta.apply_state.set_applied_index(index);
         self.meta.applied_term = term;
 
-        (header.get_sync_log(), metas)
+        if exec_res.is_some() {
+            assert!(self.pending_exec_res.is_none());
+            self.pending_exec_res = exec_res;
+        }
+        header.get_sync_log()
     }
 
     fn handle_put(&mut self, req: &Request, db: &DB) {
@@ -250,7 +280,7 @@ impl Delegate {
         &mut self,
         req: &AdminRequest,
         mut response: AdminResponse,
-    ) -> Option<Vec<RegionMeta>> {
+    ) -> Option<ExecRes> {
         let split_reqs = req.get_splits();
         let new_regions = response.take_splits().take_regions().into_vec();
         if split_reqs.get_requests().is_empty() {
@@ -276,7 +306,29 @@ impl Delegate {
                 metas.push(meta);
             }
         }
-        Some(metas)
+        Some(ExecRes::Split {
+            splitted_region_metas: metas,
+        })
+    }
+
+    fn exec_compute_hash(&mut self, index: u64, req_ctx: Vec<u8>) -> Option<ExecRes> {
+        Some(ExecRes::ComputeHash {
+            index,
+            region: self.meta.region.clone(),
+            raft_local_state: req_ctx,
+        })
+    }
+
+    fn exec_verify_hash(&mut self, req: &AdminRequest) -> Option<ExecRes> {
+        let verify_req = req.get_verify_hash();
+        let index = verify_req.get_index();
+        let hash = verify_req.get_hash().to_vec();
+
+        Some(ExecRes::VerifyHash {
+            index,
+            region: self.meta.region.clone(),
+            hash,
+        })
     }
 }
 
@@ -293,8 +345,9 @@ pub struct Runner {
 
     // region id -> apply state
     delegates: HashMap<u64, Delegate>,
-    pending_sync_delegates: HashSet<u64>,
+    pending_sync_delegates: Option<HashSet<u64>>,
     persist_interval: Duration,
+    consistency_scheduler: Scheduler<ConsistencyTask>,
 }
 
 impl Runner {
@@ -302,13 +355,15 @@ impl Runner {
         db: Arc<DB>,
         notifier: UnboundedSender<CommandResponseBatch>,
         persist_interval: Duration,
+        consistency_scheduler: Scheduler<ConsistencyTask>,
     ) -> Runner {
         let mut runner = Runner {
             db,
             notifier,
             persist_interval,
+            consistency_scheduler,
             delegates: HashMap::new(),
-            pending_sync_delegates: HashSet::new(),
+            pending_sync_delegates: Some(HashSet::new()),
         };
 
         let resps = runner.restore_apply_states();
@@ -379,14 +434,55 @@ impl Runner {
                 debug!("{} is pending remove, drop cmd {:?}", delegate.tag, cmd);
                 continue;
             }
-            let (sync_log, metas) = delegate.apply_cmd(cmd, &self.db);
+            let sync_log = delegate.apply_cmd(cmd, &self.db);
             if sync_log {
-                self.pending_sync_delegates.insert(region_id);
+                self.pending_sync_delegates
+                    .as_mut()
+                    .unwrap()
+                    .insert(region_id);
             }
-            if let Some(metas) = metas {
-                for m in metas {
+        }
+    }
+
+    fn handle_exec_res(&mut self, exec_res: ExecRes) {
+        match exec_res {
+            ExecRes::Split {
+                splitted_region_metas,
+            } => {
+                for m in splitted_region_metas {
                     // The region is created by split.
                     self.insert_delegates(m);
+                }
+            }
+            ExecRes::ComputeHash {
+                index,
+                region,
+                raft_local_state,
+            } => {
+                let snap = Snapshot::new(self.db.clone());
+                let reigon_id = region.get_id();
+                let task = ConsistencyTask::compute_hash(region, index, snap, raft_local_state);
+                if let Err(e) = self.consistency_scheduler.schedule(task) {
+                    error!(
+                        "[region {}] fail to schedule consistency task {}",
+                        reigon_id,
+                        e.into_inner()
+                    );
+                }
+            }
+            ExecRes::VerifyHash {
+                index,
+                region,
+                hash,
+            } => {
+                let reigon_id = region.get_id();
+                let task = ConsistencyTask::verify_hash(region, index, hash);
+                if let Err(e) = self.consistency_scheduler.schedule(task) {
+                    error!(
+                        "[region {}] fail to schedule consistency task {}",
+                        reigon_id,
+                        e.into_inner()
+                    );
                 }
             }
         }
@@ -415,9 +511,11 @@ impl Runnable<Task> for Runner {
     }
 
     fn on_tick(&mut self) {
-        let mut resps = Vec::with_capacity(self.pending_sync_delegates.len());
-        for region_id in self.pending_sync_delegates.drain() {
-            let remove = {
+        let mut pending_sync_delegates = self.pending_sync_delegates.take().unwrap();
+
+        let mut resps = Vec::with_capacity(pending_sync_delegates.len());
+        for region_id in pending_sync_delegates.drain() {
+            let (remove, exec_res) = {
                 let delegate = self.delegates.get_mut(&region_id).unwrap();
                 let resp = if delegate.pending_remove {
                     delegate.destroy(&self.db)
@@ -425,16 +523,21 @@ impl Runnable<Task> for Runner {
                     delegate.persist(&self.db)
                 };
                 resps.push(resp);
-                delegate.pending_remove
+                (delegate.pending_remove, delegate.pending_exec_res.take())
             };
             if remove {
                 info!("[region {}] is removed", region_id,);
                 self.delegates.remove(&region_id);
             }
+            if let Some(exec_res) = exec_res {
+                self.handle_exec_res(exec_res);
+            }
         }
         if !resps.is_empty() {
             self.report_applied(resps);
         }
+
+        self.pending_sync_delegates = Some(pending_sync_delegates);
     }
 
     fn shutdown(&mut self) {
@@ -442,7 +545,7 @@ impl Runnable<Task> for Runner {
             "persist all apply delegates before shutdown, total: {}",
             self.delegates.len()
         );
-        let mut resps = Vec::with_capacity(self.pending_sync_delegates.len());
+        let mut resps = Vec::with_capacity(self.delegates.len());
         for delegate in &mut self.delegates.values_mut() {
             resps.push(delegate.persist(&self.db));
         }
@@ -455,8 +558,9 @@ impl Runnable<Task> for Runner {
 impl RunnableWithTimer<Task, ()> for Runner {
     fn on_timeout(&mut self, timer: &mut Timer<()>, _: ()) {
         info!("persist apply delegates, total: {}", self.delegates.len());
+        let pending_sync_delegates = self.pending_sync_delegates.as_mut().unwrap();
         for region_id in self.delegates.keys() {
-            self.pending_sync_delegates.insert(*region_id);
+            pending_sync_delegates.insert(*region_id);
         }
 
         timer.add_task(self.persist_interval, ());
@@ -466,22 +570,11 @@ impl RunnableWithTimer<Task, ()> for Runner {
 #[cfg(test)]
 mod tests {
     use kvproto::raft_cmdpb::{BatchSplitRequest, SplitRequest};
-    use tempdir::TempDir;
 
+    use self::rocksdb_util::create_tmp_db;
     use super::*;
 
-    fn create_tmp_db(path: &str) -> (TempDir, Arc<DB>) {
-        let path = TempDir::new(path).unwrap();
-        let db = Arc::new(
-            rocksdb_util::new_engine(
-                path.path().join("db").to_str().unwrap(),
-                rocksdb_util::ALL_CFS,
-                None,
-            )
-            .unwrap(),
-        );
-        (path, db)
-    }
+    use crate::worker::Worker;
 
     fn new_split_req(key: &[u8], id: u64, children: Vec<u64>) -> SplitRequest {
         let mut req = SplitRequest::new();
@@ -495,7 +588,13 @@ mod tests {
     fn test_split() {
         let (_tmp, db) = create_tmp_db("apply-basic");
         let (notifier, _rx) = futures::sync::mpsc::unbounded();
-        let mut runner = Runner::new(db.clone(), notifier, Duration::from_secs(1));
+        let worker = Worker::new("consistency-worker");
+        let mut runner = Runner::new(
+            db.clone(),
+            notifier,
+            Duration::from_secs(1),
+            worker.scheduler(),
+        );
 
         let mut peer2 = metapb::Peer::new();
         peer2.set_id(2);
@@ -550,13 +649,13 @@ mod tests {
         let split_task = Task::commands(cmd);
 
         runner.run_batch(&mut vec![split_task]);
-        assert!(runner.pending_sync_delegates.contains(&1));
-        assert!(!runner.pending_sync_delegates.contains(&4));
+        assert!(runner.pending_sync_delegates.as_mut().unwrap().contains(&1));
+        assert!(!runner.pending_sync_delegates.as_mut().unwrap().contains(&4));
 
         // runner persist pending sync region in on_tick.
         assert!(!runner.delegates.get(&1).unwrap().wb.is_empty());
-        assert!(runner.delegates.get(&4).is_some());
         runner.on_tick();
+        assert!(runner.delegates.get(&4).is_some());
         assert!(runner.delegates.get(&1).unwrap().wb.is_empty());
 
         // Make sure splitted regions and split commands are applied atomically.
