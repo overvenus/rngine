@@ -69,6 +69,14 @@ impl Runner {
                     s.get_region().get_id(),
                     s,
                 );
+
+                // We must clean stale data first.
+                assert!(s.has_region());
+                let start_key = keys::enc_start_key(s.get_region());
+                let end_key = keys::enc_end_key(s.get_region());
+                assert!(start_key <= end_key);
+                rocksdb_util::delete_all_in_range(&self.db, &start_key, &end_key, &wb);
+
                 state = Some(s);
                 continue;
             }
