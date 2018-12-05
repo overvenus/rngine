@@ -410,10 +410,30 @@ pub fn compact_range(
     db.compact_range_cf_opt(handle, &compact_opts, start_key, end_key);
 }
 
+fn new_iterator_cf_for_db<'a>(
+    db: &'a DB,
+    cf: &str,
+    iter_opt: IterOption,
+) -> Result<DBIterator<&'a DB>, String> {
+    let handle = get_cf_handle(db, cf)?;
+    let readopts = iter_opt.build_read_opts();
+    Ok(DBIterator::new_cf(db, handle, readopts))
+}
+
 pub fn delete_all_in_range(db: &DB, start_key: &[u8], end_key: &[u8], wb: &WriteBatch) {
+    // Do not use delete range, it aborts at rocksdb::RangeDelAggregator::AddTombstones.
+    // wb.delete_range_cf(handle, start_key, end_key).unwrap();
     for cf in ALL_CFS {
         let handle = get_cf_handle(db, cf).unwrap();
-        wb.delete_range_cf(handle, start_key, end_key).unwrap();
+        let iter_opt = IterOption::new(Some(start_key.to_vec()), Some(end_key.to_vec()), false);
+        let mut it = new_iterator_cf_for_db(db, cf, iter_opt).unwrap();
+        it.seek(start_key.into());
+        while it.valid() {
+            wb.delete_cf(handle, it.key()).unwrap();
+            if !it.next() {
+                break;
+            }
+        }
     }
 }
 
