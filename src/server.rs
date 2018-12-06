@@ -13,7 +13,7 @@ use grpcio::{
 use kvproto::enginepb::{CommandRequestBatch, CommandResponseBatch, SnapshotDone, SnapshotRequest};
 use kvproto::enginepb_grpc::*;
 
-use super::engine::{ApplyTask, Engine as Rngine, SnapshotTask};
+use super::engine::{ApplyTask, Engine as Rngine, RegionTask};
 use super::worker::Scheduler;
 
 #[derive(Clone)]
@@ -21,7 +21,7 @@ pub struct Service {
     apply: Scheduler<ApplyTask>,
     applied_receiver: Arc<Mutex<Option<UnboundedReceiver<CommandResponseBatch>>>>,
 
-    snapshot: Scheduler<SnapshotTask>,
+    region: Scheduler<RegionTask>,
 }
 
 impl Service {
@@ -29,7 +29,7 @@ impl Service {
         Service {
             apply: rg.apply_scheduler(),
             applied_receiver: Arc::new(Mutex::new(rg.take_apply_receiver())),
-            snapshot: rg.snapshot_scheduler(),
+            region: rg.region_scheduler(),
         }
     }
 }
@@ -76,7 +76,7 @@ impl Engine for Service {
         sink: ClientStreamingSink<SnapshotDone>,
     ) {
         let (tx, rx) = oneshot::channel();
-        let (sender, task) = SnapshotTask::new(tx);
+        let (sender, task) = RegionTask::new(tx);
         let reqs = stream
             .for_each(move |chunk| {
                 sender.send(chunk).unwrap();
@@ -90,7 +90,7 @@ impl Engine for Service {
             .then(move |_| sink.success(Default::default()))
             .map_err(|e| error!("{:?}", e));
 
-        self.snapshot.schedule(task).unwrap();
+        self.region.schedule(task).unwrap();
         ctx.spawn(reqs);
         ctx.spawn(resp);
     }
