@@ -14,17 +14,17 @@ use super::{config, keys};
 
 mod apply;
 mod consistency;
-mod snapshot;
+mod region;
 
 pub use self::apply::{Runner as ApplyRunner, Task as ApplyTask};
 pub use self::consistency::{Runner as ConsistencyRunner, Task as ConsistencyTask};
-pub use self::snapshot::{Runner as SnapshotRunner, Task as SnapshotTask};
+pub use self::region::{Runner as RegionRunner, Task as RegionTask};
 
 pub struct Engine {
     db: Arc<DB>,
     apply_worker: Worker<ApplyTask>,
     consistency_worker: Worker<ConsistencyTask>,
-    snapshot_worker: Worker<SnapshotTask>,
+    region_worker: Worker<RegionTask>,
     applied_receiver: Option<UnboundedReceiver<CommandResponseBatch>>,
 }
 
@@ -33,7 +33,7 @@ impl Engine {
         Engine {
             db,
             apply_worker: Worker::new("apply-worker"),
-            snapshot_worker: Worker::new("snapshot-worker"),
+            region_worker: Worker::new("region-worker"),
             consistency_worker: Worker::new("consistency-worker"),
             applied_receiver: None,
         }
@@ -43,8 +43,8 @@ impl Engine {
         self.apply_worker.scheduler()
     }
 
-    pub fn snapshot_scheduler(&self) -> Scheduler<SnapshotTask> {
-        self.snapshot_worker.scheduler()
+    pub fn region_scheduler(&self) -> Scheduler<RegionTask> {
+        self.region_worker.scheduler()
     }
 
     pub fn start(&mut self, cfg: &config::RgConfig) {
@@ -64,8 +64,8 @@ impl Engine {
             .start_with_timer(apply_runner, apply_timer)
             .unwrap();
 
-        let snap_runner = SnapshotRunner::new(self.db.clone(), self.apply_worker.scheduler());
-        self.snapshot_worker.start(snap_runner).unwrap();
+        let region_runner = RegionRunner::new(self.db.clone(), self.apply_worker.scheduler());
+        self.region_worker.start(region_runner).unwrap();
     }
 
     pub fn take_apply_receiver(&mut self) -> Option<UnboundedReceiver<CommandResponseBatch>> {
@@ -77,7 +77,7 @@ impl Engine {
             handler.join().unwrap()
         }
 
-        if let Some(handler) = self.snapshot_worker.stop() {
+        if let Some(handler) = self.region_worker.stop() {
             handler.join().unwrap()
         }
     }
