@@ -9,18 +9,28 @@ use kvproto::enginepb::{
 };
 use kvproto::metapb;
 use kvproto::raft_cmdpb::{AdminCmdType, AdminRequest, AdminResponse, CmdType, Request};
+use kvproto::raft_serverpb::RaftApplyState;
 use raft::eraftpb;
 use rocksdb::{DBIterator, Writable, WriteBatch, WriteOptions, DB};
 
 use super::super::keys::{self, escape};
 use super::super::rocksdb_util::{self, Snapshot, CF_DEFAULT};
 use super::super::worker::{Runnable, RunnableWithTimer, Scheduler, Timer};
-use super::ConsistencyTask;
 use super::{initial_apply_state, write_region_meta, RegionMeta};
+use super::{ConsistencyTask, RegionTask};
 
 pub enum Task {
-    Commands { commands: CommandRequestBatch },
-    Snap { meta: RegionMeta },
+    Commands {
+        commands: CommandRequestBatch,
+    },
+    Snap {
+        meta: RegionMeta,
+    },
+    Destroyed {
+        region_id: u64,
+        // applied_term and apply state.
+        apply_state: Option<(u64, RaftApplyState)>,
+    },
 }
 
 impl Task {
@@ -31,6 +41,13 @@ impl Task {
     pub fn snap(meta: RegionMeta) -> Task {
         Task::Snap { meta }
     }
+
+    pub fn destroyed(region_id: u64, apply_state: Option<(u64, RaftApplyState)>) -> Task {
+        Task::Destroyed {
+            region_id,
+            apply_state,
+        }
+    }
 }
 
 impl fmt::Display for Task {
@@ -39,6 +56,7 @@ impl fmt::Display for Task {
     }
 }
 
+#[derive(Debug)]
 enum ExecRes {
     Split {
         splitted_region_metas: Vec<RegionMeta>,
@@ -53,6 +71,7 @@ enum ExecRes {
         region: metapb::Region,
         hash: Vec<u8>,
     },
+    RemoveNode,
 }
 
 const DEFAULT_APPLY_WB_SIZE: usize = 4 * 1024;
@@ -98,39 +117,6 @@ impl Delegate {
         self.meta.to_command_response()
     }
 
-    fn destroy(&mut self, db: &DB) -> CommandResponse {
-        assert!(self.pending_remove);
-        info!(
-            "{} destroy apply delegate {:?}",
-            self.tag, self.meta.apply_state
-        );
-
-        let start_key = keys::enc_start_key(&self.meta.region);
-        let end_key = keys::enc_end_key(&self.meta.region);
-        assert!(start_key <= end_key);
-
-        rocksdb_util::delete_all_in_range(db, &start_key, &end_key, &self.wb);
-        let apply_state_key = keys::apply_state_key(self.meta.region.get_id());
-        self.wb.delete(&apply_state_key).unwrap_or_else(|e| {
-            panic!(
-                "{} failed to delete {}: {:?}",
-                self.tag,
-                escape(&apply_state_key),
-                e
-            )
-        });
-
-        let mut write_opts = WriteOptions::new();
-        write_opts.set_sync(true);
-        let mut wb = WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE);
-        ::std::mem::swap(&mut self.wb, &mut wb);
-        db.write_opt(wb, &write_opts).unwrap_or_else(|e| {
-            panic!("failed to write to engine: {:?}", e);
-        });
-
-        self.meta.to_command_response()
-    }
-
     fn apply_cmd(&mut self, mut cmd: CommandRequest, db: &DB) -> bool {
         assert!(!self.pending_remove);
         let mut header = cmd.take_header();
@@ -150,7 +136,7 @@ impl Delegate {
             // Caller must mark it as a sync log request.
             assert!(header.get_sync_log());
             match cmd_type {
-                AdminCmdType::ChangePeer => self.exec_change_peer(&request, response),
+                AdminCmdType::ChangePeer => exec_res = self.exec_change_peer(&request, response),
                 AdminCmdType::BatchSplit => exec_res = self.exec_batch_split(&request, response),
                 // To support compact log, we need to persist all changes to disk.
                 AdminCmdType::CompactLog => (),
@@ -248,7 +234,11 @@ impl Delegate {
         }
     }
 
-    fn exec_change_peer(&mut self, request: &AdminRequest, mut response: AdminResponse) {
+    fn exec_change_peer(
+        &mut self,
+        request: &AdminRequest,
+        mut response: AdminResponse,
+    ) -> Option<ExecRes> {
         let request = request.get_change_peer();
         let new_region = response.take_change_peer().take_region();
 
@@ -263,6 +253,7 @@ impl Delegate {
         match request.get_change_type() {
             eraftpb::ConfChangeType::AddNode | eraftpb::ConfChangeType::AddLearnerNode => {
                 self.meta.region = new_region;
+                None
             }
             eraftpb::ConfChangeType::RemoveNode => {
                 let peer = request.get_peer();
@@ -271,6 +262,9 @@ impl Delegate {
                     // So we need not to apply following logs.
                     self.pending_remove = true;
                     info!("{} removes self", self.tag);
+                    Some(ExecRes::RemoveNode)
+                } else {
+                    None
                 }
             }
         }
@@ -348,6 +342,7 @@ pub struct Runner {
     pending_sync_delegates: Option<HashSet<u64>>,
     persist_interval: Duration,
     consistency_scheduler: Scheduler<ConsistencyTask>,
+    region_scheduler: Scheduler<RegionTask>,
 }
 
 impl Runner {
@@ -356,12 +351,14 @@ impl Runner {
         notifier: UnboundedSender<CommandResponseBatch>,
         persist_interval: Duration,
         consistency_scheduler: Scheduler<ConsistencyTask>,
+        region_scheduler: Scheduler<RegionTask>,
     ) -> Runner {
         let mut runner = Runner {
             db,
             notifier,
             persist_interval,
             consistency_scheduler,
+            region_scheduler,
             delegates: HashMap::new(),
             pending_sync_delegates: Some(HashSet::new()),
         };
@@ -419,6 +416,33 @@ impl Runner {
         }
     }
 
+    fn report_destoryed(&self, region_id: u64, apply_state: Option<(u64, RaftApplyState)>) {
+        let mut resp = CommandResponse::new();
+        resp.mut_header().set_region_id(region_id);
+        if let Some((term, apply_state)) = apply_state {
+            // The region was destroyed by conf change(remove node).
+            info!(
+                "[region {}] report apply delegates destroyed by remove node\
+                 at term {} apply state {:?}",
+                region_id, term, apply_state
+            );
+            resp.set_applied_term(term);
+            resp.set_apply_state(apply_state);
+        } else {
+            // The region was destroyed by tombstone messages.
+            info!(
+                "[region {}] report apply delegates destroyed by tombstone message",
+                region_id
+            );
+            resp.mut_header().set_destroyed(true);
+        }
+        let mut resps_batch = CommandResponseBatch::new();
+        resps_batch.set_responses(vec![resp].into());
+        if let Err(e) = self.notifier.unbounded_send(resps_batch) {
+            error!("response notifier is closed {:?}", e);
+        }
+    }
+
     fn apply_cmds(&mut self, mut cmds: CommandRequestBatch) {
         for cmd in cmds.take_requests().into_vec() {
             assert!(cmd.has_header());
@@ -428,6 +452,18 @@ impl Runner {
                 delegate = d;
             } else {
                 error!("[region {}] is missing", region_id);
+                continue;
+            }
+            if cmd.get_header().get_destroy() {
+                info!(
+                    "[region {}] is going to be destroyed by tombstone ...",
+                    region_id
+                );
+                delegate.pending_remove = true;
+                self.pending_sync_delegates
+                    .as_mut()
+                    .unwrap()
+                    .insert(region_id);
                 continue;
             }
             if delegate.pending_remove {
@@ -485,6 +521,7 @@ impl Runner {
                     );
                 }
             }
+            ExecRes::RemoveNode => unreachable!(),
         }
     }
 
@@ -506,6 +543,12 @@ impl Runnable<Task> for Runner {
                     // The region is created by snapshot.
                     self.insert_delegates(meta);
                 }
+                Task::Destroyed {
+                    region_id,
+                    apply_state,
+                } => {
+                    self.report_destoryed(region_id, apply_state);
+                }
             }
         }
     }
@@ -515,19 +558,29 @@ impl Runnable<Task> for Runner {
 
         let mut resps = Vec::with_capacity(pending_sync_delegates.len());
         for region_id in pending_sync_delegates.drain() {
-            let (remove, exec_res) = {
+            let (removed, exec_res) = {
                 let delegate = self.delegates.get_mut(&region_id).unwrap();
-                let resp = if delegate.pending_remove {
-                    delegate.destroy(&self.db)
-                } else {
-                    delegate.persist(&self.db)
+                if !delegate.pending_remove {
+                    let resp = delegate.persist(&self.db);
+                    resps.push(resp);
                 };
-                resps.push(resp);
                 (delegate.pending_remove, delegate.pending_exec_res.take())
             };
-            if remove {
-                info!("[region {}] is removed", region_id,);
-                self.delegates.remove(&region_id);
+            if removed {
+                debug!(
+                    "[region {}] is removed with pending_exec_res {:?}",
+                    region_id, exec_res
+                );
+                let d = self.delegates.remove(&region_id).unwrap();
+                let by_conchange = match exec_res {
+                    Some(ExecRes::RemoveNode) => true,
+                    None => false,
+                    other => panic!("unexpected {:?}", other),
+                };
+                self.region_scheduler
+                    .schedule(RegionTask::destroy(d.meta, by_conchange))
+                    .unwrap();
+                continue;
             }
             if let Some(exec_res) = exec_res {
                 self.handle_exec_res(exec_res);
@@ -588,12 +641,14 @@ mod tests {
     fn test_split() {
         let (_tmp, db) = create_tmp_db("apply-basic");
         let (notifier, _rx) = futures::sync::mpsc::unbounded();
-        let worker = Worker::new("consistency-worker");
+        let rworker = Worker::new("region-worker");
+        let cworker = Worker::new("consistency-worker");
         let mut runner = Runner::new(
             db.clone(),
             notifier,
             Duration::from_secs(1),
-            worker.scheduler(),
+            cworker.scheduler(),
+            rworker.scheduler(),
         );
 
         let mut peer2 = metapb::Peer::new();

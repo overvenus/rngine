@@ -48,24 +48,32 @@ impl Engine {
     }
 
     pub fn start(&mut self, cfg: &config::RgConfig) {
+        let consistency_scheduler = self.consistency_worker.scheduler();
+        let apply_scheduler = self.apply_scheduler();
+        let region_scheduler = self.region_scheduler();
+
+        // Start consistency_worker.
         let consistency_runner = ConsistencyRunner::new();
         self.consistency_worker.start(consistency_runner).unwrap();
 
+        // Start region_worker.
+        let region_runner = RegionRunner::new(self.db.clone(), apply_scheduler);
+        self.region_worker.start(region_runner).unwrap();
+
+        // Start apply_worker.
         let (tx, rx) = unbounded();
         self.applied_receiver = Some(rx);
         let apply_runner = ApplyRunner::new(
             self.db.clone(),
             tx,
             cfg.persist_interval.0,
-            self.consistency_worker.scheduler(),
+            consistency_scheduler,
+            region_scheduler,
         );
         let apply_timer = apply_runner.timer();
         self.apply_worker
             .start_with_timer(apply_runner, apply_timer)
             .unwrap();
-
-        let region_runner = RegionRunner::new(self.db.clone(), self.apply_worker.scheduler());
-        self.region_worker.start(region_runner).unwrap();
     }
 
     pub fn take_apply_receiver(&mut self) -> Option<UnboundedReceiver<CommandResponseBatch>> {
@@ -198,6 +206,19 @@ pub fn write_region_meta(meta: &RegionMeta, wb: &WriteBatch) {
     wb.put(&apply_state_key, &buffer).unwrap_or_else(|e| {
         panic!(
             "[region {}] failed to persist apply state {}: {:?}",
+            region_id,
+            keys::escape(&apply_state_key),
+            e
+        )
+    });
+}
+
+pub fn remove_region_meta(meta: &RegionMeta, wb: &WriteBatch) {
+    let region_id = meta.region.get_id();
+    let apply_state_key = keys::apply_state_key(region_id);
+    wb.delete(&apply_state_key).unwrap_or_else(|e| {
+        panic!(
+            "[region {}] failed to remove apply state {}: {:?}",
             region_id,
             keys::escape(&apply_state_key),
             e

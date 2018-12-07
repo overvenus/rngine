@@ -76,7 +76,7 @@ impl Engine for Service {
         sink: ClientStreamingSink<SnapshotDone>,
     ) {
         let (tx, rx) = oneshot::channel();
-        let (sender, task) = RegionTask::new(tx);
+        let (sender, task) = RegionTask::snapshot(tx);
         let reqs = stream
             .for_each(move |chunk| {
                 sender.send(chunk).unwrap();
