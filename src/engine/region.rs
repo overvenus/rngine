@@ -9,17 +9,30 @@ use rocksdb::{Writable, WriteBatch, WriteOptions, DB};
 use super::super::keys::{self, escape};
 use super::super::rocksdb_util;
 use super::super::worker::{Runnable, Scheduler};
-use super::{write_region_meta, ApplyTask, RegionMeta};
+use super::{remove_region_meta, write_region_meta, ApplyTask, RegionMeta};
 
-pub struct Task {
-    requests: Receiver<SnapshotRequest>,
-    done: OneshotSender<()>,
+pub enum Task {
+    Snapshot {
+        requests: Receiver<SnapshotRequest>,
+        done: OneshotSender<()>,
+    },
+    Destroy {
+        meta: RegionMeta,
+        by_confchange: bool,
+    },
 }
 
 impl Task {
-    pub fn new(done: OneshotSender<()>) -> (Sender<SnapshotRequest>, Task) {
+    pub fn snapshot(done: OneshotSender<()>) -> (Sender<SnapshotRequest>, Task) {
         let (tx, requests) = channel();
-        (tx, Task { requests, done })
+        (tx, Task::Snapshot { requests, done })
+    }
+
+    pub fn destroy(meta: RegionMeta, by_confchange: bool) -> Task {
+        Task::Destroy {
+            meta,
+            by_confchange,
+        }
     }
 }
 
@@ -44,10 +57,7 @@ impl Runner {
         }
     }
 
-    fn apply_snapshot(&mut self, task: Task) {
-        let requests = task.requests;
-        let done = task.done;
-
+    fn apply_snapshot(&mut self, requests: Receiver<SnapshotRequest>, done: OneshotSender<()>) {
         let wb = WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE);
         let mut state: Option<SnapshotState> = None;
         loop {
@@ -127,13 +137,48 @@ impl Runner {
         done.send(()).unwrap();
         info!("[region {}] snapshot applied", region_id);
     }
+
+    fn apply_destroy(&mut self, meta: RegionMeta, by_confchange: bool) {
+        let wb = WriteBatch::with_capacity(DEFAULT_APPLY_WB_SIZE);
+        let start_key = keys::enc_start_key(&meta.region);
+        let end_key = keys::enc_end_key(&meta.region);
+        assert!(start_key <= end_key);
+
+        // Clean up data.
+        rocksdb_util::delete_all_in_range(&self.db, &start_key, &end_key, &wb);
+
+        // Clean up meta data.
+        remove_region_meta(&meta, &wb);
+
+        let mut write_opts = WriteOptions::new();
+        write_opts.set_sync(true);
+        self.db.write_opt(wb, &write_opts).unwrap_or_else(|e| {
+            panic!("failed to write to engine: {:?}", e);
+        });
+
+        let apply_state = if by_confchange {
+            info!("[region {}] is delete by conf change", meta.region.get_id());
+            Some((meta.applied_term, meta.apply_state))
+        } else {
+            info!("[region {}] is delete by tombstone", meta.region.get_id());
+            None
+        };
+        self.apply_scheduler
+            .schedule(ApplyTask::destroyed(meta.region.get_id(), apply_state))
+            .unwrap();
+    }
 }
 
 impl Runnable<Task> for Runner {
     fn run_batch(&mut self, batch: &mut Vec<Task>) {
         for task in batch.drain(..) {
-            info!("receive a snapshot");
-            self.apply_snapshot(task);
+            match task {
+                Task::Snapshot { requests, done } => self.apply_snapshot(requests, done),
+                Task::Destroy {
+                    meta,
+                    by_confchange,
+                } => self.apply_destroy(meta, by_confchange),
+            }
         }
     }
 }
