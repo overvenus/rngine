@@ -123,6 +123,13 @@ impl Delegate {
         let term = header.get_term();
         let index = header.get_index();
 
+        // Zero index and term means TiKV wants us to persist data.
+        if term == 0 && index == 0 {
+            info!("{} try to persist", self.tag);
+            assert!(header.get_sync_log());
+            return true;
+        }
+
         let mut exec_res = None;
         if cmd.has_admin_request() {
             let request = cmd.take_admin_request();
@@ -558,7 +565,7 @@ impl Runnable<Task> for Runner {
 
         let mut resps = Vec::with_capacity(pending_sync_delegates.len());
         for region_id in pending_sync_delegates.drain() {
-            let (removed, exec_res) = {
+            let (pending_remove, exec_res) = {
                 let delegate = self.delegates.get_mut(&region_id).unwrap();
                 if !delegate.pending_remove {
                     let resp = delegate.persist(&self.db);
@@ -566,7 +573,7 @@ impl Runnable<Task> for Runner {
                 };
                 (delegate.pending_remove, delegate.pending_exec_res.take())
             };
-            if removed {
+            if pending_remove {
                 debug!(
                     "[region {}] is removed with pending_exec_res {:?}",
                     region_id, exec_res
