@@ -129,12 +129,14 @@ impl Runner {
         });
 
         // Send snapshot state to apply worker.
-        self.apply_scheduler
-            .schedule(ApplyTask::snap(region_meta))
-            .unwrap();
+        if let Err(e) = self.apply_scheduler.schedule(ApplyTask::snap(region_meta)) {
+            error!("[region {}] schedule apply task failed {:?}", region_id, e);
+        }
 
         // Notify apply snapshot finished.
-        done.send(()).unwrap();
+        if let Err(e) = done.send(()) {
+            error!("[region {}] reply snapshot done failed {:?}", region_id, e);
+        }
         info!("[region {}] snapshot applied", region_id);
     }
 
