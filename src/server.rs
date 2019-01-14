@@ -5,10 +5,10 @@ use std::sync::Mutex;
 
 use futures::sync::mpsc::UnboundedReceiver;
 use futures::sync::oneshot;
-use futures::{Future, Sink, Stream};
+use futures::{stream, Async, Future, Sink, Stream};
 use grpcio::{
-    ChannelBuilder, ClientStreamingSink, DuplexSink, EnvBuilder, Environment, RequestStream,
-    RpcContext, Server as GrpcServer, ServerBuilder, WriteFlags,
+    ChannelBuilder, ClientStreamingSink, DuplexSink, Environment, RequestStream, RpcContext,
+    RpcStatus, RpcStatusCode, Server as GrpcServer, ServerBuilder, WriteFlags,
 };
 use kvproto::enginepb::{CommandRequestBatch, CommandResponseBatch, SnapshotDone, SnapshotRequest};
 use kvproto::enginepb_grpc::*;
@@ -41,7 +41,20 @@ impl Engine for Service {
         stream: RequestStream<CommandRequestBatch>,
         sink: DuplexSink<CommandResponseBatch>,
     ) {
+        let mut applied_receiver = self.applied_receiver.lock().unwrap().take();
+        if applied_receiver.is_none() {
+            let fail = sink.fail(RpcStatus::new(
+                RpcStatusCode::Unavailable,
+                Some("apply already scheduled".to_owned()),
+            ));
+            ctx.spawn(fail.map_err(|e| {
+                error!("{:?}", e);
+            }));
+            return;
+        }
+
         let apply = self.apply.clone();
+        let (tx, mut done) = oneshot::channel();
         let reqs = stream
             .for_each(move |cmds| {
                 apply.schedule(ApplyTask::commands(cmds)).unwrap();
@@ -49,19 +62,37 @@ impl Engine for Service {
             })
             .map_err(|e| {
                 error!("{:?}", e);
-            });
+            })
+            .then(move |_| tx.send(()));
 
-        let applied_receiver = self
-            .applied_receiver
-            .lock()
-            .unwrap()
-            .take()
-            .expect("apply already started");
+        let applied_receiver_holder = self.applied_receiver.clone();
+        let poll_and_put_back = stream::poll_fn(move || {
+            let res = match done.poll() {
+                Ok(Async::Ready(_)) | Err(_) => Ok(Async::Ready(None)),
+                Ok(Async::NotReady) => {
+                    match applied_receiver.as_mut().expect("already finished").poll() {
+                        Ok(Async::Ready(Some(item))) => {
+                            debug!("polled a request");
+                            return Ok(Async::Ready(Some((item, WriteFlags::default()))));
+                        }
+                        Ok(Async::NotReady) => return Ok(Async::NotReady),
+                        Ok(Async::Ready(None)) => Ok(Async::Ready(None)),
+                        Err(e) => {
+                            error!("{:?}", e);
+                            Err(e)
+                        }
+                    }
+                }
+            };
+            debug!("put receiver back");
+            *applied_receiver_holder.lock().unwrap() = applied_receiver.take();
+            res
+        });
         let resps = sink
             .sink_map_err(|e| {
                 error!("{:?}", e);
             })
-            .send_all(applied_receiver.map(|resp| (resp, WriteFlags::default())))
+            .send_all(poll_and_put_back)
             .map(|_| ())
             .map_err(|e| error!("{:?}", e));
 
@@ -102,9 +133,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn start(addr: &str, svc: Service) -> Server {
-        let env = EnvBuilder::new().cq_count(1).name_prefix("rg").build();
-        let env = Arc::new(env);
+    pub fn start(env: Arc<Environment>, addr: &str, svc: Service) -> Server {
         let args = ChannelBuilder::new(env.clone())
             .max_receive_message_len(-1)
             .max_send_message_len(-1)
@@ -126,5 +155,77 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.server.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use grpcio::EnvBuilder;
+
+    use super::*;
+    use crate::worker;
+
+    use futures::sync::mpsc::unbounded;
+
+    #[test]
+    fn test_reconnect() {
+        env_logger::init();
+
+        let (apply, apply_rx) = worker::dummy_scheduler();
+        let (region, _region_rx) = worker::dummy_scheduler();
+        let (mut applied_tx, applied_receiver) = unbounded();
+        let svc = Service {
+            apply,
+            applied_receiver: Arc::new(Mutex::new(Some(applied_receiver))),
+            region,
+        };
+
+        let env = Arc::new(EnvBuilder::new().cq_count(2).name_prefix("rg").build());
+        let server = Server::start(env.clone(), &"127.0.0.1:0", svc);
+        let port = server.server.bind_addrs()[0].1;
+        let ch = ChannelBuilder::new(env).connect(&format!("127.0.0.1:{}", port));
+        let client = EngineClient::new(ch);
+
+        {
+            // The first connection.
+            let (sender1, receiver1) = client.apply_command_batch().unwrap();
+            let _sender1 = sender1
+                .send((CommandRequestBatch::new(), WriteFlags::default()))
+                .wait()
+                .unwrap();
+            apply_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+            applied_tx = applied_tx.send(CommandResponseBatch::new()).wait().unwrap();
+            let (resp, _receiver1) = receiver1.into_future().wait().map_err(|(e, _)| e).unwrap();
+            resp.unwrap();
+
+            // The second connection should fail.
+            let (_sender2, receiver2) = client.apply_command_batch().unwrap();
+            match receiver2.into_future().wait().map_err(|(e, _)| e) {
+                Err(grpcio::Error::RpcFailure(status)) => {
+                    assert_eq!(status.status, RpcStatusCode::Unavailable);
+                    assert_eq!(
+                        status.details.unwrap(),
+                        "apply already scheduled".to_owned()
+                    );
+                }
+                Err(e) => panic!("unexpected {:?}", e),
+                _ => panic!("unexpected"),
+            }
+
+            // Drop the first and the second connections.
+        }
+
+        // A new connection.
+        let (sender1, receiver1) = client.apply_command_batch().unwrap();
+        let _sender1 = sender1
+            .send((CommandRequestBatch::new(), WriteFlags::default()))
+            .wait()
+            .unwrap();
+        apply_rx.recv_timeout(Duration::from_millis(100)).unwrap();
+        let _applied_tx = applied_tx.send(CommandResponseBatch::new()).wait().unwrap();
+        let (resp, _receiver1) = receiver1.into_future().wait().map_err(|(e, _)| e).unwrap();
+        resp.unwrap();
     }
 }

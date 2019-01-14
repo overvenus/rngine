@@ -23,6 +23,8 @@ extern crate slog_stdlog;
 extern crate slog_term;
 
 #[cfg(test)]
+extern crate env_logger;
+#[cfg(test)]
 extern crate tempdir;
 
 pub mod config;
