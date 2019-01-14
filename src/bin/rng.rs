@@ -17,6 +17,7 @@ use std::{panic, process, thread};
 
 use clap::{App, Arg, ArgMatches};
 use fs2::FileExt;
+use grpcio::EnvBuilder;
 use slog::{Drain, Logger};
 use slog_async::{Async, OverflowStrategy};
 use slog_scope::GlobalLoggerGuard;
@@ -138,7 +139,8 @@ fn main() {
     let mut engine = Engine::new(db);
     engine.start(&config);
     let service = Service::new(&mut engine);
-    let _server = Server::start(&config.address, service);
+    let env = Arc::new(EnvBuilder::new().cq_count(2).name_prefix("rg").build());
+    let _server = Server::start(env, &config.address, service);
 
     handle_signal();
 

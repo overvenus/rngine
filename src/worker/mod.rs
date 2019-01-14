@@ -172,10 +172,13 @@ impl<T> Clone for Scheduler<T> {
 ///
 /// Useful for test purpose.
 #[cfg(test)]
-pub fn dummy_scheduler<T: Display>() -> Scheduler<T> {
-    let (tx, _) = mpsc::channel();
+pub fn dummy_scheduler<T: Display>() -> (Scheduler<T>, Receiver<Option<T>>) {
+    let (tx, rx) = mpsc::channel();
     let sender = TaskSender::Unbounded(tx);
-    Scheduler::new("dummy scheduler", AtomicUsize::new(0), sender)
+    (
+        Scheduler::new("dummy scheduler", AtomicUsize::new(0), sender),
+        rx,
+    )
 }
 
 #[derive(Copy, Clone)]
